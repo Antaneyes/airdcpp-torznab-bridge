@@ -8,3 +8,4 @@ Thumbs.db
 .idea/
 dist/
 build/
+bridge_hashes.json
