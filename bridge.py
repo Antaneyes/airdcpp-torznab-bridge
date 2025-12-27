@@ -88,6 +88,10 @@ def save_hashes():
         print(f"ERROR: No se pudo guardar el archivo de hashes: {e}")
 
 def get_hex_hash(tth):
+    if not tth:
+        print("DEBUG: get_hex_hash recibió un TTH vacío o None.")
+        return ""
+    
     if tth in HASH_MAP_TTH_TO_HEX:
         return HASH_MAP_TTH_TO_HEX[tth]
     
@@ -118,6 +122,34 @@ def normalize_text(text):
     # Filtrar solo caracteres que no sean acentos (Mn = Mark, Nonspacing)
     text = "".join([c for c in text if unicodedata.category(c) != 'Mn'])
     return text.lower().strip()
+
+def clean_search_pattern(text):
+    """Limpia un nombre complejo para hacerlo más apto para búsqueda en el Hub."""
+    import re
+    if not text: return ""
+    
+    # 1. Quitar contenido entre corchetes y paréntesis (tags, años, etc)
+    text = re.sub(r'\[.*?\]', '', text)
+    text = re.sub(r'\(.*?\)', '', text)
+    
+    # 2. Reemplazar puntos, guiones bajos y guiones por espacios
+    text = text.replace(".", " ").replace("_", " ").replace("-", " ")
+    
+    # 3. Quitar indicadores de temporada (problemáticos para búsqueda literal)
+    text = re.sub(r'\b(Temporada|Season|Staffel|Temp|Part|Pt|S|T)\s*\d+\b', '', text, flags=re.IGNORECASE)
+    
+    # 4. Quitar tags comunes de release
+    text = re.sub(r'\b(NF|WEB-DL|HMAX|DSNP|AMZN|AVC|DD\+|Atmos|HDO|1080p|720p|x264|x265|HEVC|Dual|PACK)\b', '', text, flags=re.IGNORECASE)
+    
+    # 5. Quedarse con las primeras 4 palabras (título base)
+    words = text.split()
+    clean = " ".join(words[:4]).strip()
+    
+    # Si la limpieza ha borrado TODO, devolvemos las primeras palabras del original
+    if not clean and words:
+        return " ".join(words[:3]) or text
+        
+    return clean
 
 @app.on_event("startup")
 def startup_event():
@@ -501,7 +533,7 @@ def extract_titles_from_tvmaze_show(show_data):
                     if not name: continue
                     
                     # Priorizamos alias en español
-                    if ak.get("country", {}).get("code") == "ES":
+                    if (ak.get("country") or {}).get("code") == "ES":
                         if name not in spanish_titles:
                             spanish_titles.append(name)
                     elif not ak.get("country"): # Alias general
@@ -574,23 +606,36 @@ def search_airdcpp(query_or_list, is_season_search=False, season_num=None):
             hub_res = requests.post(f"{AIRDCPP_URL}/api/v1/search/{instance_id}/hub_search", json=search_payload, headers=headers, timeout=10)
             hub_res.raise_for_status()
             
-            # 3. Polling optimizado (cada 1s, máx 12s)
+            # 3. Polling optimizado (cada 1s, máx 15s)
             raw_results = []
-            max_results = 1000
-            for i in range(12):
+            max_results = 2000
+            last_stable_count = -1
+            stable_cycles = 0
+            
+            for i in range(15):
                 time.sleep(1)
-                results_res = requests.get(f"{AIRDCPP_URL}/api/v1/search/{instance_id}/results/0/{max_results}", headers=headers, timeout=5)
-                if results_res.status_code == 200:
-                    current_results = results_res.json()
-                    new_count = len(current_results)
-                    old_count = len(raw_results)
-                    raw_results = current_results
-                    
-                    # Salida temprana: si tenemos resultados y no han llegado nuevos en 2 segundos
-                    if new_count > 0 and i > 3:
-                        # Si en este ciclo no hubo cambios con respecto al anterior
-                        if new_count == old_count:
-                             break
+                try:
+                    results_res = requests.get(f"{AIRDCPP_URL}/api/v1/search/{instance_id}/results/0/{max_results}", headers=headers, timeout=5)
+                    if results_res.status_code == 200:
+                        current_results = results_res.json()
+                        current_count = len(current_results)
+                        raw_results = current_results
+                        
+                        # Lógica de estabilidad: salir solo si el conteo se mantiene igual 
+                        # durante al menos 4 segundos (ciclos) y tenemos algún resultado.
+                        if current_count > 0:
+                            if current_count == last_stable_count:
+                                stable_cycles += 1
+                            else:
+                                stable_cycles = 0
+                                
+                            if stable_cycles >= 4:
+                                print(f"  -> Búsqueda estabilizada en {current_count} resultados.")
+                                break
+                        
+                        last_stable_count = current_count
+                except Exception:
+                    continue
             
             print(f"  -> '{q_attempt}': {len(raw_results)} resultados brutos encontrados.")
             
@@ -599,7 +644,7 @@ def search_airdcpp(query_or_list, is_season_search=False, season_num=None):
             
             # 5. Filtrar resultados de esta variante
             video_extensions = ('.mkv', '.avi', '.mp4', '.m4v', '.mov', '.wmv', '.mpg', '.mpeg')
-            min_size = 1024 * 1024 * 1024 if is_season_search else 50 * 1024 * 1024
+            min_size = 100 * 1024 * 1024 if is_season_search else 50 * 1024 * 1024
             has_ep_pattern = re.search(r'[Ss]\d{2}[Ee]\d{2}', q_attempt)
             
             for r in raw_results:
@@ -620,18 +665,81 @@ def search_airdcpp(query_or_list, is_season_search=False, season_num=None):
                             # print(f"DEBUG: Descartado por temporada: {name_raw}")
                             continue
                     
-                    # Renombrar genéricos
+                    # Formato para Sonarr: Inyectamos el SXX después del título de la serie para que sea estándar
                     s_num = str(season_num or "").zfill(2)
-                    generic_names = [f"temporada {season_num}", f"temporada {s_num}", f"season {season_num}", f"season {s_num}", f"t{season_num}", f"t{s_num}", f"s{season_num}", f"s{s_num}", "temporada completa"]
-                    display_name = f"{final_queries[0]} - {name_raw}" if name_lower.strip() in generic_names else name_raw
+                    display_season_tag = f"S{s_num}"
+                    series_name = final_queries[0]
+                    
+                    name_lower = name_raw.lower()
+                    series_lower = series_name.lower()
+                    
+                    # Regex para detectar el tag de temporada redundante (S7, T7, Temporada 7...)
+                    s_clean_pattern = rf'(?:[ST]|Temporada|Season|Staffel|Temp|Pt|Part|P)\s*[.\-_]?\s*0?{season_num}\b'
+
+                    # Ver si el nombre del hub ya contiene ALGUNA de las variantes buscadas (español o inglés)
+                    matched_alias = None
+                    for q in final_queries:
+                        if q.lower() in name_lower:
+                            matched_alias = q
+                            break
+
+                    if matched_alias:
+                        # Si ya tiene un nombre de serie (sea cual sea), solo nos aseguramos de que tenga el SXX
+                        if display_season_tag.lower() in name_lower:
+                            display_name = name_raw
+                        else:
+                            # Inyectar SXX tras el alias encontrado (+ año si existe)
+                            alias_lower = matched_alias.lower()
+                            idx = name_lower.find(alias_lower) + len(alias_lower)
+                            
+                            # Si sigue el año "(2019)", lo incluimos en el prefijo
+                            year_match = re.search(r'^\s*\(?\d{4}\)?', name_raw[idx:])
+                            if year_match:
+                                idx += len(year_match.group(0))
+                            
+                            prefix = name_raw[:idx].strip()
+                            suffix = name_raw[idx:].strip()
+                            
+                            # Limpiar de la parte restante cualquier tag de temporada REDUNDANTE
+                            suffix = re.sub(s_clean_pattern, '', suffix, flags=re.IGNORECASE).strip()
+                            suffix = re.sub(r'^[\s.\-_]+', '', suffix) # Limpiar conectores
+                            
+                            if suffix:
+                                display_name = f"{prefix} {display_season_tag} {suffix}"
+                            else:
+                                display_name = f"{prefix} {display_season_tag}"
+                    else:
+                        # Si no coincide con ninguna variante conocida (ej: nombre genérico o alias raro)
+                        # Prependemos la primera variante (título principal)
+                        name_cleaned = re.sub(s_clean_pattern, '', name_raw, flags=re.IGNORECASE).strip()
+                        name_cleaned = re.sub(r'^[\s.\-_]+', '', name_cleaned)
+                        
+                        if name_cleaned:
+                            # Si tiene info extra, la conservamos
+                            display_name = f"{final_queries[0]} {display_season_tag} - {name_raw}"
+                        else:
+                            # Era solo un tag de temporada genérico
+                            display_name = f"{final_queries[0]} {display_season_tag}"
                 else:
                     if not name_lower.endswith(video_extensions): continue
                     display_name = name_raw
                 
                 if size_bytes < min_size: continue
                 if has_ep_pattern and has_ep_pattern.group(0).lower() not in name_lower.replace(".", " ").replace("-", " "): continue
+                
+                # VALIDACIÓN / GENERACIÓN DE TTH
+                tth = r.get("tth")
+                if not tth:
+                    if item_type in ["directory", "bundle"]:
+                        # Usar el nombre de pantalla (que incluye la serie) para el TTH sintético 
+                        # Esto ayuda al fallback de búsqueda en qbit_add
+                        tth = f"SYNTH:{display_name}:{size_bytes}"
+                        print(f"DEBUG: Generado TTH sintético para carpeta: {tth}")
+                    else:
+                        print(f"DEBUG: Saltando archivo '{display_name}' por TTH vacío.")
+                        continue
                         
-                variant_results.append({"name": display_name, "size": size_bytes, "tth": r["tth"]})
+                variant_results.append({"name": display_name, "size": size_bytes, "tth": tth})
                 
         except Exception as e:
             print(f"Error en variante '{q_attempt}': {e}")
@@ -1007,6 +1115,12 @@ async def qbit_add(request: Request):
             
         if raw_hash:
             tth = HASH_MAP_HEX_TO_TTH.get(raw_hash, raw_hash)
+            
+            # BLOQUEO DE TTH VACÍO (pero permitir sintéticos)
+            if not tth or tth == "da39a3ee5e6b4b0d3255bfef95601890afd80709":
+                print(f"  - ERROR CRÍTICO: El hash recibido ({raw_hash}) corresponde a un TTH vacío. No se puede descargar.")
+                continue
+
             instance_id = None
             
             try:
@@ -1021,28 +1135,99 @@ async def qbit_add(request: Request):
                 res.raise_for_status()
                 instance_id = res.json()["id"]
                 
-                # 2. Lanzar búsqueda por TTH (lo más preciso)
-                search_payload = {
-                    "query": {
-                        "pattern": tth
-                    },
-                    "hub_urls": []
-                }
+                # 2. LANZAR BÚSQUEDA
+                if tth.startswith("SYNTH:"):
+                    # Si es sintético, buscamos por NOMBRE SIMPLIFICADO (fallback)
+                    parts = tth.split("SYNTH:")[1].rsplit(":", 1)
+                    full_name = parts[0]
+                    target_size_int = int(parts[1])
+                    
+                    search_pattern = clean_search_pattern(full_name)
+                    print(f"  - Usando fallback de búsqueda (Patrón: '{search_pattern}', Original: '{full_name}')")
+                    
+                    search_payload = {
+                        "query": {
+                            "pattern": search_pattern
+                        },
+                        "hub_urls": []
+                    }
+                else:
+                    # Búsqueda normal por TTH
+                    search_payload = {
+                        "query": {
+                            "pattern": tth
+                        },
+                        "hub_urls": []
+                    }
+                
                 requests.post(f"{AIRDCPP_URL}/api/v1/search/{instance_id}/hub_search", json=search_payload, headers=headers, timeout=10)
                 
-                # 3. Esperar a que el hub responda (polling corto)
-                print(f"  - Esperando resultados para {tth}...")
-                time.sleep(3)
+                # 3. Polling robusto de resultados (esperar a que se estabilice el conteo)
+                print(f"  - Esperando resultados...")
+                results = []
+                last_count = -1
+                for i in range(15):
+                    time.sleep(1)
+                    # Si es sintético, pedimos más para filtrar el mejor match manual
+                    max_results_to_fetch = 2000 if tth.startswith("SYNTH:") else 1
+                    try:
+                        results_res = requests.get(f"{AIRDCPP_URL}/api/v1/search/{instance_id}/results/0/{max_results_to_fetch}", headers=headers, timeout=5)
+                        if results_res.status_code == 200:
+                            current_results = results_res.json()
+                            current_count = len(current_results)
+                            results = current_results
+                            
+                            # Salida temprana si el conteo se estabiliza (al menos 6 ciclos)
+                            if current_count > 0 and i > 6:
+                                if current_count == last_count:
+                                    break
+                                
+                            last_count = current_count
+                    except:
+                        continue
                 
-                # 4. Obtener el primer resultado
-                results_res = requests.get(f"{AIRDCPP_URL}/api/v1/search/{instance_id}/results/0/1", headers=headers, timeout=10)
-                results = results_res.json()
-                
+                selected_result = None
                 if results:
-                    result_id = results[0]["id"]
-                    print(f"  - Resultado encontrado ({result_id}). Iniciando descarga...")
+                    if tth.startswith("SYNTH:"):
+                        # Filtrar el mejor match para el sintético
+                        parts = tth.split("SYNTH:")[1].rsplit(":", 1)
+                        target_name = parts[0]
+                        target_size_int = int(parts[1])
+                        
+                        print(f"  - Analizando {len(results)} resultados de búsqueda para match con Size: {target_size_int}...")
+                        for r in results:
+                            r_size_raw = r.get("size", 0)
+                            r_size_int = int(float(r_size_raw))
+                            r_name = r.get("name")
+                            
+                            # Obtener tipo para filtrar
+                            r_type_raw = r.get("type", "file")
+                            r_type = r_type_raw.get("id", "file") if isinstance(r_type_raw, dict) else str(r_type_raw)
+                            
+                            # Ignorar archivos pequeños (solo carpetas o bundles grandes)
+                            if r_type not in ["directory", "bundle"] and r_size_int < 1024*1024*1024:
+                                continue
+
+                            # Intentar match por tamaño exacto (lo más fiable)
+                            if r_size_int == target_size_int:
+                                print(f"  - Match encontrado por tamaño exacto! ({r_name})")
+                                selected_result = r
+                                break
+                            
+                            # Fallback: coincidencia cercana (1MB) y nombre parecido
+                            if r_size_int > 0 and abs(r_size_int - target_size_int) < 1024 * 1024:
+                                if target_name[:10].lower() in r_name.lower():
+                                    print(f"  - Match cercano encontrado (dif: {abs(r_size_int - target_size_int)} bytes)")
+                                    selected_result = r
+                                    break
+                    else:
+                        selected_result = results[0]
+
+                if selected_result:
+                    result_id = selected_result["id"]
+                    print(f"  - Resultado encontrado ({result_id}: {selected_result['name']}). Iniciando descarga...")
                     
-                    # 5. Ejecutar descarga (Prioridad 3 = Normal/Activa)
+                    # 5. Ejecutar descarga
                     dl_res = requests.post(
                         f"{AIRDCPP_URL}/api/v1/search/{instance_id}/results/{result_id}/download", 
                         json={"priority": 3}, 
@@ -1061,7 +1246,7 @@ async def qbit_add(request: Request):
                             save_hashes()
                             print(f"  - Mapeo guardado: Bundle {new_bundle_id} -> TTH {tth} (Cat: {cat})")
                 else:
-                    print(f"  - ERROR: No se encontraron fuentes en los hubs para el TTH {tth} tras 3s.")
+                    print(f"  - ERROR: No se encontraron fuentes adecuadas en los hubs para el TTH {tth} tras la búsqueda de fallback.")
                     
             except Exception as e:
                 print(f"  - ERROR procesando {tth}: {e}")
