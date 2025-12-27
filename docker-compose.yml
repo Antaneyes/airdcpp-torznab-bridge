@@ -1,0 +1,18 @@
+services:
+  # El Bridge personalizado
+  airdcpp-bridge:
+    build: .
+    container_name: airdcpp-bridge
+    ports:
+      - 8000:8000
+    environment:
+      - AIRDCPP_URL=${AIRDCPP_URL}
+      - AIRDCPP_USER=${AIRDCPP_USER}
+      - AIRDCPP_PASS=${AIRDCPP_PASS}
+      - AIRDCPP_API_KEY=${AIRDCPP_API_KEY}
+      - TMDB_API_KEY=${TMDB_API_KEY}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./bridge_hashes.json:/app/bridge_hashes.json
+    restart: unless-stopped
