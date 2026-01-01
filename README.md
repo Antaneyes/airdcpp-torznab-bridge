@@ -30,7 +30,7 @@ Este proyecto actúa como un puente (bridge) entre **AirDC++** y las aplicacione
 ## ⚙️ Configuración en Radarr/Sonarr
 
 ### 1. Indexador (Torznab)
-- **URL**: `http://localhost:8000/torznab/api`
+- **URL**: `http://localhost:8000/torznab`
 - **API Key**: (Cualquier valor, el puente no la valida)
 - **Categorías**: 5000 (TV), 2000 (Movies).
 

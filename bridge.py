@@ -9,6 +9,7 @@ import xml.sax.saxutils as saxutils
 import hashlib
 import xml.etree.ElementTree as ET
 import unicodedata
+import threading
 from fastapi import FastAPI, Request, Response, Query
 from fastapi.responses import JSONResponse
 from typing import Optional
@@ -32,7 +33,6 @@ async def health():
 
 # Configuración
 AIRDCPP_URL = os.getenv("AIRDCPP_URL", "http://localhost:5600")
-AIRDCPP_API_KEY = os.getenv("AIRDCPP_API_KEY", "")
 AIRDCPP_USER = os.getenv("AIRDCPP_USER", "")
 AIRDCPP_PASS = os.getenv("AIRDCPP_PASS", "")
 TMDB_API_KEY = "f637fd7b5ef5b4c62249b8d67122a0f6"
@@ -40,22 +40,59 @@ TMDB_API_KEY = "f637fd7b5ef5b4c62249b8d67122a0f6"
 SESSION_TOKEN = None
 
 # Persistencia de Hashes TTH <-> Hex y Bundle IDs
-HASH_FILE = "/app/bridge_hashes.json"
+HASH_FILE = "/app/data/bridge_hashes.json"
 HASH_MAP_TTH_TO_HEX = {}
 HASH_MAP_HEX_TO_TTH = {}
 BUNDLE_MAP_ID_TO_TTH = {}  # Mapeo de AirDC++ Bundle ID -> TTH
 BUNDLE_MAP_ID_TO_CAT = {}  # Mapeo de AirDC++ Bundle ID -> Categoría (radarr/sonarr)
 FINISHED_BUNDLES_CACHE = {} # Mapeo de TTH -> Bundle Info finalizado
 TITLE_CACHE = {} # Mapeo de ID -> [Nombres]
+KNOWN_CATEGORIES = ["airdcpp", "radarr", "sonarr"] # Categorías permitidas en Radarr/Sonarr
+
+# Semáforo para limitar búsquedas simultáneas en AirDC++ (1 por sesión para evitar kicks)
+GLOBAL_SEARCH_LOCK = threading.Semaphore(1)
+# Lock para proteger la escritura del archivo de hashes
+FILE_LOCK = threading.Lock()
 
 def load_hashes():
     global HASH_MAP_TTH_TO_HEX, HASH_MAP_HEX_TO_TTH, BUNDLE_MAP_ID_TO_TTH, FINISHED_BUNDLES_CACHE
-    if os.path.exists(HASH_FILE):
+    
+    # --- LÓGICA DE MIGRACIÓN Y PROTECCIÓN ---
+    OLD_PATH = "/app/bridge_hashes.json"
+    
+    # 1. Si HASH_FILE es una carpeta (fallo de Docker), lo ignoramos para no crashear
+    if os.path.isdir(HASH_FILE):
+        print(f"ALERTA: '{HASH_FILE}' es una carpeta (posible error de montaje Docker). Usando ruta interna temporal.")
+        temp_path = "/app/bridge_hashes_backup.json"
+        
+        # Intentar migrar desde la vieja si existe
+        if os.path.isfile(OLD_PATH) and not os.path.exists(temp_path):
+            import shutil
+            shutil.copy(OLD_PATH, temp_path)
+            print("INFO: Datos migrados de la ruta antigua a ruta temporal.")
+            
+        load_from_path(temp_path)
+        return
+
+    # 2. Migración normal del archivo suelto a la nueva carpeta /data/
+    if not os.path.exists(HASH_FILE) and os.path.isfile(OLD_PATH):
         try:
-            with open(HASH_FILE, "r") as f:
+            os.makedirs(os.path.dirname(HASH_FILE), exist_ok=True)
+            import shutil
+            shutil.copy(OLD_PATH, HASH_FILE)
+            print(f"INFO: Se han migrado los hashes automáticamente desde {OLD_PATH}")
+        except Exception as e:
+            print(f"AVISO: No se pudo migrar automáticamente: {e}")
+
+    load_from_path(HASH_FILE)
+
+def load_from_path(path):
+    global HASH_MAP_TTH_TO_HEX, HASH_MAP_HEX_TO_TTH, BUNDLE_MAP_ID_TO_TTH, FINISHED_BUNDLES_CACHE
+    if os.path.exists(path) and os.path.isfile(path):
+        try:
+            with open(path, "r") as f:
                 content = f.read().strip()
-                if not content:
-                    content = "{}"
+                if not content: content = "{}"
                 data = json.loads(content)
                 
                 if "hashes" in data:
@@ -65,27 +102,27 @@ def load_hashes():
                     FINISHED_BUNDLES_CACHE = data.get("finished", {})
                 else:
                     HASH_MAP_TTH_TO_HEX = data
-                    BUNDLE_MAP_ID_TO_TTH = {}
-                    BUNDLE_MAP_ID_TO_CAT = {}
-                    FINISHED_BUNDLES_CACHE = {}
                 
                 HASH_MAP_HEX_TO_TTH = {v: k for k, v in HASH_MAP_TTH_TO_HEX.items()}
-                print(f"INFO: {len(HASH_MAP_TTH_TO_HEX)} hashes, {len(BUNDLE_MAP_ID_TO_TTH)} bundles y {len(FINISHED_BUNDLES_CACHE)} finished cargados.")
+                print(f"INFO: Carga completada desde {path}: {len(HASH_MAP_TTH_TO_HEX)} hashes.")
         except Exception as e:
-            print(f"ERROR: No se pudo cargar el archivo de hashes: {e}")
+            print(f"ERROR: No se pudo leer {path}: {e}")
 
 def save_hashes():
-    try:
-        data = {
-            "hashes": HASH_MAP_TTH_TO_HEX,
-            "bundles": BUNDLE_MAP_ID_TO_TTH,
-            "categories": BUNDLE_MAP_ID_TO_CAT,
-            "finished": FINISHED_BUNDLES_CACHE
-        }
-        with open(HASH_FILE, "w") as f:
-            json.dump(data, f)
-    except Exception as e:
-        print(f"ERROR: No se pudo guardar el archivo de hashes: {e}")
+    with FILE_LOCK:
+        try:
+            # Asegurar que el directorio de datos existe
+            os.makedirs(os.path.dirname(HASH_FILE), exist_ok=True)
+            data = {
+                "hashes": HASH_MAP_TTH_TO_HEX,
+                "bundles": BUNDLE_MAP_ID_TO_TTH,
+                "categories": BUNDLE_MAP_ID_TO_CAT,
+                "finished": FINISHED_BUNDLES_CACHE
+            }
+            with open(HASH_FILE, "w") as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f"ERROR: No se pudo guardar el archivo de hashes: {e}")
 
 def get_hex_hash(tth):
     if not tth:
@@ -104,9 +141,6 @@ def get_hex_hash(tth):
 load_hashes()
 
 def get_auth_headers():
-    if AIRDCPP_API_KEY:
-        return {"Authorization": f"Bearer {AIRDCPP_API_KEY}"}
-    
     if AIRDCPP_USER and AIRDCPP_PASS:
         auth_str = f"{AIRDCPP_USER}:{AIRDCPP_PASS}"
         encoded_auth = base64.b64encode(auth_str.encode()).decode()
@@ -169,8 +203,9 @@ def startup_event():
     print("--- Test de Conectividad Finalizado ---")
 
 @app.get("/api")
+@app.get("/torznab")
 @app.get("/torznab/api")
-async def torznab_api(
+def torznab_api(
     request: Request,
     t: str, 
     q: Optional[str] = None, 
@@ -253,7 +288,8 @@ async def torznab_api(
             if fq not in dedup_queries:
                 dedup_queries.append(fq)
             
-        results = search_airdcpp(dedup_queries, is_season_search=is_season_search, season_num=season)
+        with GLOBAL_SEARCH_LOCK:
+            results = search_airdcpp(dedup_queries, is_season_search=is_season_search, season_num=season)
         
         # Construimos el base_url
         host = request.headers.get("host", "localhost:8000")
@@ -900,19 +936,19 @@ async def qbit_preferences():
 async def qbit_maindata(category: Optional[str] = None):
     # Radarr pide esto frecuentemente. Devolver la lista de torrents.
     torrents = {}
-    qbit_list = await qbit_info(category=category)
+    qbit_list = qbit_info(category=category)
     for t in qbit_list:
         torrents[t["hash"]] = t
         
     return {
         "torrents": torrents, 
         "full_update": True, 
-        "categories": {"airdcpp": {"name": "airdcpp", "savePath": "/downloads"}}
+        "categories": {cat: {"name": cat, "savePath": "/downloads"} for cat in KNOWN_CATEGORIES}
     }
 
 @app.get("/api/v2/torrents/categories")
 async def qbit_categories():
-    return {"airdcpp": {"name": "airdcpp", "savePath": "/downloads"}}
+    return {cat: {"name": cat, "savePath": "/downloads"} for cat in KNOWN_CATEGORIES}
 
 @app.post("/api/v2/torrents/createCategory")
 async def qbit_create_category():
@@ -984,7 +1020,7 @@ async def qbit_delete(hash: str = Query(None), hashes: str = Query(None)):
     return Response(content="Ok.", media_type="text/plain")
 
 @app.get("/api/v2/torrents/info")
-async def qbit_info(category: Optional[str] = None):
+def qbit_info(category: Optional[str] = None):
     headers = get_auth_headers()
     try:
         # Consultamos la cola de AirDC++
@@ -1085,7 +1121,8 @@ async def qbit_add(request: Request):
     headers = get_auth_headers()
     form_data = await request.form()
     
-    print(f"--- NUEVA SOLICITUD DE DESCARGA (qbit_add) ---")
+    with GLOBAL_SEARCH_LOCK:
+        print(f"--- NUEVA SOLICITUD DE DESCARGA (qbit_add) ---")
     print(f"Headers: {dict(request.headers)}")
     print(f"Form keys: {list(form_data.keys())}")
     
@@ -1241,6 +1278,11 @@ async def qbit_add(request: Request):
                         if "bundle_info" in dl_data:
                             new_bundle_id = str(dl_data["bundle_info"]["id"])
                             cat = form_data.get("category", "radarr")
+                            
+                            # Registrar categoría si es nueva
+                            if cat not in KNOWN_CATEGORIES:
+                                KNOWN_CATEGORIES.append(cat)
+                                
                             BUNDLE_MAP_ID_TO_TTH[new_bundle_id] = tth
                             BUNDLE_MAP_ID_TO_CAT[new_bundle_id] = cat
                             save_hashes()
