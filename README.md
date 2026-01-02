@@ -22,7 +22,8 @@ Este proyecto actúa como un puente (bridge) entre **AirDC++** y las aplicacione
    ```bash
    docker compose up -d
    ```
-   *Esto descargará automáticamente la última imagen oficial desde GitHub Container Registry.*
+    *Esto descargará automáticamente la última imagen oficial desde GitHub Container Registry o Docker Hub.*
+    - También puedes usar la imagen de Docker Hub: `joshua/airdcpp-torznab-bridge:latest` (sustituye por tu usuario).
 
 ## ⚙️ Configuración en Radarr/Sonarr
 
