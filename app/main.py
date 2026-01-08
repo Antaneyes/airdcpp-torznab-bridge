@@ -3,6 +3,7 @@ import time
 import requests
 from app.routers import general, torznab, qbittorrent
 from app.services.airdcpp import AIRDCPP_URL, get_auth_headers
+from app.services.persistence import load_hashes
 from app.core.logging import setup_logging, get_logger
 
 # Inicializar logging
@@ -41,6 +42,9 @@ async def session_middleware(request: Request, call_next):
 
 @app.on_event("startup")
 def startup_event():
+    logger.info("--- Iniciando AirDC++ Bridge ---")
+    load_hashes() # Asegurar que la base de datos se inicializa y loguea la ruta
+    
     logger.info("--- Test de Conectividad AirDC++ ---")
     try:
         r = requests.get(f"{AIRDCPP_URL}/api/v1/hubs", headers=get_auth_headers(), timeout=5)

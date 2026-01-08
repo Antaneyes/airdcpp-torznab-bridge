@@ -4,6 +4,7 @@ from app.config import TMDB_API_KEY
 from app.core.logging import get_logger
 
 logger = get_logger("app.metadata")
+logger.info(f"Configuración de metadatos cargada. TMDB_API_KEY detectada: {'SÍ' if TMDB_API_KEY else 'NO'}")
 
 TITLE_CACHE = {} # Mapeo de ID -> [Nombres]
 
