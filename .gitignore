@@ -9,4 +9,5 @@ Thumbs.db
 dist/
 build/
 bridge_hashes.json
+bridge.db
 data/
