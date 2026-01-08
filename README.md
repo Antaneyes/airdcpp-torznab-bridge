@@ -33,6 +33,9 @@ services:
     
     # OPCIÓN B: Versión de Desarrollo (Novedades)
     # image: ghcr.io/antaneyes/airdcpp-torznab-bridge:dev
+
+    # OPCIÓN C: Desarrollo Local (Construir desde el código)
+    # build: . 
     
     container_name: airdcpp-bridge
     ports:
@@ -55,7 +58,7 @@ docker compose up -d
 ```
 
 > [!TIP]
-> Si quieres probar las últimas funciones antes de que salgan a la versión principal, cambia la etiqueta de la imagen a `:dev` y ejecuta `docker compose pull && docker compose up -d`.
+> Si quieres probar las últimas funciones antes de que salgan a la versión principal, cambia la etiqueta de la imagen de `:latest` a `:dev` y ejecuta `docker compose pull && docker compose up -d`.
 
 ## ⚙️ Configuración en Radarr/Sonarr
 
