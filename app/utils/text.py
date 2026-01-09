@@ -18,18 +18,21 @@ def clean_search_pattern(text):
     text = re.sub(r'\[.*?\]', '', text)
     text = re.sub(r'\(.*?\)', '', text)
     
-    # 2. Reemplazar puntos, guiones bajos y guiones por espacios
-    text = text.replace(".", " ").replace("_", " ").replace("-", " ")
+    # 2. Reemplazar puntuación y caracteres especiales por espacios
+    # Incluimos coma, dos puntos, punto y coma, exclamación, interrogación, etc.
+    for char in ".,:;!?_-()[]":
+        text = text.replace(char, " ")
     
     # 3. Quitar indicadores de temporada (problemáticos para búsqueda literal)
     text = re.sub(r'\b(Temporada|Season|Staffel|Temp|Part|Pt|S|T)\s*\d+\b', '', text, flags=re.IGNORECASE)
     
     # 4. Quitar tags comunes de release
-    text = re.sub(r'\b(NF|WEB-DL|HMAX|DSNP|AMZN|AVC|DD\+|Atmos|HDO|1080p|720p|x264|x265|HEVC|Dual|PACK)\b', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b(NF|WEB-DL|HMAX|DSNP|AMZN|AVC|DD\+|Atmos|HDO|1080p|720p|x264|x265|HEVC|Dual|PACK|REMASTERED|EXTENDED|REPACK|UNRATED|BLURAY|BDRIP|BRRIP)\b', '', text, flags=re.IGNORECASE)
     
-    # 5. Quedarse con las primeras 7 palabras (título base)
+    # 5. Quedarse con las primeras 5 palabras (título base)
+    # Master usaba 4, Dev usaba 7. 5 es un buen punto medio para evitar excesiva basura.
     words = text.split()
-    clean = " ".join(words[:7]).strip()
+    clean = " ".join(words[:5]).strip()
     
     # Si la limpieza ha borrado TODO, devolvemos las primeras palabras del original
     if not clean and words:

@@ -39,18 +39,26 @@ def search_airdcpp(query_or_list, is_season_search=False, season_num=None, cat_p
     
     queries_to_try = query_or_list if isinstance(query_or_list, list) else [query_or_list]
 
-    # Expandir con fallbacks (quitar año)
+    # Expandir con fallbacks (quitar año) y LIMPIAR patrones
     expanded_queries = []
     for q in queries_to_try:
         if not q: continue
-        expanded_queries.append(q)
+        
+        # 1. Query limpia (sin puntuación, sin tags, etc)
+        q_clean = clean_search_pattern(q)
+        if q_clean and q_clean not in expanded_queries:
+            expanded_queries.append(q_clean)
+        
+        # 2. Fallback sin año
         match_year = re.search(r'\s(\d{4})$', q)
         if match_year:
             base_no_year = q.replace(match_year.group(0), "").strip()
-            if base_no_year not in expanded_queries:
-                expanded_queries.append(base_no_year)
+            q_fallback_clean = clean_search_pattern(base_no_year)
+            if q_fallback_clean and q_fallback_clean not in expanded_queries:
+                expanded_queries.append(q_fallback_clean)
             
     final_queries = list(dict.fromkeys(expanded_queries)) # Dedup preservando orden
+    logger.info(f"Variantes de búsqueda finales: {final_queries}")
 
     logger.info(f"Iniciando búsqueda AirDC++ con {len(final_queries)} variantes en paralelo")
     all_results = []
