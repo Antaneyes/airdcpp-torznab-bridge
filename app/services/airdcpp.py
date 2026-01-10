@@ -39,23 +39,33 @@ def search_airdcpp(query_or_list, is_season_search=False, season_num=None, cat_p
     
     queries_to_try = query_or_list if isinstance(query_or_list, list) else [query_or_list]
 
-    # Expandir con fallbacks (quitar año) y LIMPIAR patrones
+    # Expandir con fallbacks y LIMPIAR patrones (Doble Capa)
     expanded_queries = []
     for q in queries_to_try:
         if not q: continue
         
-        # 1. Query limpia (sin puntuación, sin tags, etc)
-        q_clean = clean_search_pattern(q)
-        if q_clean and q_clean not in expanded_queries:
-            expanded_queries.append(q_clean)
+        # 1. Capa Precisa: Título completo limpio
+        q_full = clean_search_pattern(q)
+        if q_full and q_full not in expanded_queries:
+            expanded_queries.append(q_full)
+            
+        # 2. Capa Auxiliar: Título corto (5 palabras) para capturar nombres abreviados
+        q_short = clean_search_pattern(q, max_words=5)
+        if q_short and q_short not in expanded_queries:
+            expanded_queries.append(q_short)
         
-        # 2. Fallback sin año
+        # 3. Fallback sin año (también con doble capa)
         match_year = re.search(r'\s(\d{4})$', q)
         if match_year:
             base_no_year = q.replace(match_year.group(0), "").strip()
-            q_fallback_clean = clean_search_pattern(base_no_year)
-            if q_fallback_clean and q_fallback_clean not in expanded_queries:
-                expanded_queries.append(q_fallback_clean)
+            
+            q_fallback_full = clean_search_pattern(base_no_year)
+            if q_fallback_full and q_fallback_full not in expanded_queries:
+                expanded_queries.append(q_fallback_full)
+                
+            q_fallback_short = clean_search_pattern(base_no_year, max_words=5)
+            if q_fallback_short and q_fallback_short not in expanded_queries:
+                expanded_queries.append(q_fallback_short)
             
     final_queries = list(dict.fromkeys(expanded_queries)) # Dedup preservando orden
     logger.info(f"Variantes de búsqueda finales: {final_queries}")

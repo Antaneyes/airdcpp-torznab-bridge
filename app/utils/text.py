@@ -10,7 +10,7 @@ def normalize_text(text):
     text = "".join([c for c in text if unicodedata.category(c) != 'Mn'])
     return text.lower().strip()
 
-def clean_search_pattern(text):
+def clean_search_pattern(text, max_words=None):
     """Limpia un nombre complejo para hacerlo más apto para búsqueda en el Hub."""
     if not text: return ""
     
@@ -26,16 +26,15 @@ def clean_search_pattern(text):
     # 3. Quitar indicadores de temporada (problemáticos para búsqueda literal)
     text = re.sub(r'\b(Temporada|Season|Staffel|Temp|Part|Pt|S|T)\s*\d+\b', '', text, flags=re.IGNORECASE)
     
-    # 4. Quitar tags comunes de release
-    text = re.sub(r'\b(NF|WEB-DL|HMAX|DSNP|AMZN|AVC|DD\+|Atmos|HDO|1080p|720p|x264|x265|HEVC|Dual|PACK|REMASTERED|EXTENDED|REPACK|UNRATED|BLURAY|BDRIP|BRRIP)\b', '', text, flags=re.IGNORECASE)
-    
-    # 5. Quedarse con las primeras 5 palabras (título base)
-    # Master usaba 4, Dev usaba 7. 5 es un buen punto medio para evitar excesiva basura.
+    # 4. Limpieza final de espacios extra y truncado opcional
     words = text.split()
-    clean = " ".join(words[:5]).strip()
+    if max_words:
+        words = words[:max_words]
     
-    # Si la limpieza ha borrado TODO, devolvemos las primeras palabras del original
-    if not clean and words:
-        return " ".join(words[:3]) or text
+    clean = " ".join(words).strip()
+    
+    # Si la limpieza ha borrado TODO (poco probable), devolvemos el original
+    if not clean:
+        return text
         
     return clean
