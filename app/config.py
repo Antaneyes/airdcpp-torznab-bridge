@@ -10,6 +10,7 @@ TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
 KNOWN_CATEGORIES = ["airdcpp", "radarr", "sonarr", "lidarr", "readarr"]
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 HASH_FILE = os.path.join(DATA_DIR, "bridge_hashes.json")
+SAVE_PATH = os.getenv("SAVE_PATH", "/downloads")
 
 # Perfiles de filtrado por tipo de contenido
 CATEGORY_PROFILES = {

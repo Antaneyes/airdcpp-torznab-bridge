@@ -27,6 +27,10 @@ AIRDCPP_PASS=tu_password
 
 # Opcional pero recomendado para resolución de nombres en español
 TMDB_API_KEY=tu_api_key_aqui
+
+# Opcional: Ruta absoluta donde se descargan los archivos (clave para importación)
+# Debe ser la ruta que "ve" Sonarr/Radarr en su propio contenedor
+SAVE_PATH=/downloads
 ```
 
 - **Importante**: Añade tu `TMDB_API_KEY` para que el bridge pueda encontrar los nombres de las películas en español.
@@ -70,6 +74,9 @@ docker compose up -d
 
 > [!TIP]
 > Si quieres probar las últimas funciones antes de que salgan a la versión principal, cambia la etiqueta de la imagen de `:latest` a `:dev` y ejecuta `docker compose pull && docker compose up -d`.
+
+> [!WARNING]
+> Con cada actualización, asegúrate de revisar si hay nuevas variables en el `.env.example` y de actualizar tu `docker-compose.yml` para incluirlas en la sección `environment`. Si falta alguna variable obligatoria, el bridge podría no funcionar correctamente.
 
 ## ⚙️ Configuración en Radarr/Sonarr
 

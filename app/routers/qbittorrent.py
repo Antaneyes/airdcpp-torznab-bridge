@@ -5,7 +5,7 @@ import re
 import urllib.parse
 from fastapi import APIRouter, Response, Query, Request, Form, File, UploadFile, HTTPException
 from typing import Optional
-from app.config import KNOWN_CATEGORIES, AIRDCPP_URL
+from app.config import KNOWN_CATEGORIES, AIRDCPP_URL, SAVE_PATH
 from app.core.locks import GLOBAL_SEARCH_LOCK
 from app.core.logging import get_logger
 from app.services.persistence import (
@@ -38,16 +38,16 @@ async def qbit_login(response: Response):
 
 @router.get("/api/v2/app/preferences")
 async def qbit_preferences():
-    return {"save_path": "/downloads", "listen_port": 8000}
+    return {"save_path": SAVE_PATH, "listen_port": 8000}
 
 @router.get("/api/v2/torrents/categories")
 async def qbit_categories():
-    return {cat: {"name": cat, "savePath": "/downloads"} for cat in KNOWN_CATEGORIES}
+    return {cat: {"name": cat, "savePath": SAVE_PATH} for cat in KNOWN_CATEGORIES}
 
 @router.get("/api/v2/torrents/properties")
 async def qbit_properties(hash: str):
     return {
-        "save_path": "/downloads",
+        "save_path": SAVE_PATH,
         "creation_date": int(time.time()),
         "piece_size": 16384,
         "is_seed": True,
@@ -127,7 +127,8 @@ def _get_qbit_info_internal(category: Optional[str] = None):
                 "state": state,
                 "amount_left": max(0, size - downloaded),
                 "completed": int(b.get("time_finished", 0)),
-                "save_path": "/downloads",
+                "save_path": SAVE_PATH,
+                "content_path": os.path.join(SAVE_PATH, b["name"]),
                 "label": bundle_cat,
                 "category": bundle_cat,
                 "num_seeds": 1 if is_completed else 0,
@@ -158,7 +159,7 @@ def qbit_info(category: Optional[str] = None):
 @router.get("/api/v2/sync/maindata")
 def qbit_maindata(category: Optional[str] = None):
     torrents = {t["hash"]: t for t in _get_qbit_info_internal(category=category)}
-    return {"torrents": torrents, "full_update": True, "categories": {cat: {"name": cat, "savePath": "/downloads"} for cat in KNOWN_CATEGORIES}}
+    return {"torrents": torrents, "full_update": True, "categories": {cat: {"name": cat, "savePath": SAVE_PATH} for cat in KNOWN_CATEGORIES}}
 
 @router.post("/api/v2/torrents/add")
 def qbit_add(request: Request, urls: Optional[str] = Form(None), category: Optional[str] = Form(None)):
