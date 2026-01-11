@@ -28,10 +28,10 @@ AIRDCPP_PASS=tu_password
 # Opcional pero recomendado para resolución de nombres en español
 TMDB_API_KEY=tu_api_key_aqui
 
-# Opcional: Ruta absoluta donde se descargan los archivos (clave para importación)
-# Debe ser la ruta que "ve" Sonarr/Radarr en su propio contenedor
+# Ruta donde se descargan los archivos (visto por Sonarr/Radarr en su contenedor)
 SAVE_PATH=/downloads
 ```
+
 
 - **Importante**: Añade tu `TMDB_API_KEY` para que el bridge pueda encontrar los nombres de las películas en español.
 
@@ -60,6 +60,7 @@ services:
       - AIRDCPP_USER=${AIRDCPP_USER}
       - AIRDCPP_PASS=${AIRDCPP_PASS}
       - TMDB_API_KEY=${TMDB_API_KEY}
+      - SAVE_PATH=${SAVE_PATH}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
