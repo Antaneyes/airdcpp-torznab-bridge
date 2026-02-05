@@ -116,6 +116,23 @@ def _get_qbit_info_internal(category: Optional[str] = None):
             else:
                 state = "downloading"
 
+            # === CALCULAR CAMPOS DE RATIO Y SUBIDA ===
+            if is_completed:
+                # Cuando está completado, simulamos ratio 1.5 (150% subido)
+                uploaded = int(size * 1.5)
+                ratio = 1.5
+                upspeed = 0  # No hay subida activa, ya completó
+            elif progress == 0:
+                # Aún no ha empezado a descargar
+                uploaded = 0
+                ratio = 0.0
+                upspeed = 0
+            else:
+                # Durante la descarga, simular subida proporcional (50% de lo descargado)
+                uploaded = int(size * progress * 0.5)
+                ratio = 0.5 if downloaded > 0 else 0.0
+                upspeed = int(float(b.get("speed", 0)) * 0.3)  # 30% de velocidad de descarga
+
             # INFO COMPLETA PARA SONARR/RADARR
             res_item = {
                 "hash": fake_hash,
@@ -134,11 +151,16 @@ def _get_qbit_info_internal(category: Optional[str] = None):
                 "num_seeds": 1 if is_completed else 0,
                 "num_leechs": 0,
                 "added_on": int(b.get("time_added", time.time())),
-                "completion_on": int(b.get("time_finished", 0))
+                "completion_on": int(b.get("time_finished", 0)),
+                # === CAMPOS DE RATIO Y SUBIDA ===
+                "uploaded": uploaded,
+                "downloaded": downloaded,
+                "ratio": ratio,
+                "upspeed": upspeed
             }
             if is_completed:
                 if tth not in FINISHED_BUNDLES_CACHE:
-                    logger.info(f"Bundle {b['name']} marcado como completado en cache.")
+                    logger.info(f"Bundle {b['name']} marcado como completado en cache. Ratio simulado: 1.5")
                     needs_save = True
                 FINISHED_BUNDLES_CACHE[tth] = res_item
             qbit_results.append(res_item)
