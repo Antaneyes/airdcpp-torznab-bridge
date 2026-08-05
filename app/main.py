@@ -1,65 +1,81 @@
-from app.core.logging import setup_logging, get_logger
-
-# Inicializar logging lo antes posible
-setup_logging()
-logger = get_logger("app.main")
-
-from fastapi import FastAPI, Request
+import logging
 import time
-import requests
-from app.routers import general, torznab, qbittorrent
-from app.services.airdcpp import AIRDCPP_URL, get_auth_headers
-from app.services.persistence import load_hashes
+import uuid
+from contextlib import asynccontextmanager
 
-app = FastAPI(title="AirDC++ Torznab/qBit Bridge")
+import httpx
+from fastapi import FastAPI, Request
 
-@app.middleware("http")
-async def session_middleware(request: Request, call_next):
-    start_time = time.time()
-    response = await call_next(request)
-    duration = time.time() - start_time
-    
-    path = request.url.path
-    # Rutas ruidosas de Radarr/Sonarr
-    noisy_paths = ["/api/v2/app/webapiVersion", "/api/v2/app/preferences", "/api/v2/torrents/info"]
-    
-    log_msg = f"RES: {request.method} {path} - Status: {response.status_code} - Tiempo: {duration:.2f}s"
-    
-    # Lógica de niveles:
-    # 1. Si es un error, siempre INFO
-    if response.status_code >= 400:
-        logger.info(log_msg)
-    # 2. Si es una ruta ruidosa y fue rápida, a DEBUG (oculto)
-    elif any(noisy in path for noisy in noisy_paths) and duration < 0.5:
-        logger.debug(log_msg)
-    # 3. Si es una búsqueda de torznab muy rápida (caché), a DEBUG (oculto)
-    elif "/torznab" in path and duration < 0.1:
-        logger.debug(log_msg)
-    # 4. Todo lo demás (descargas, borrados, búsquedas reales) a INFO
-    else:
-        logger.info(log_msg)
-    
-    return response
+from app.config import Settings, get_settings
+from app.core.logging import setup_logging
+from app.routers import general, qbittorrent, torznab
+from app.services.airdcpp import AirDCClient
+from app.services.cache import AsyncTTLCache
+from app.services.database import Repository
+from app.services.metadata import MetadataClient
+from app.services.search import SearchService
 
-@app.on_event("startup")
-def startup_event():
-    logger.info("--- Iniciando AirDC++ Bridge ---")
-    load_hashes() # Asegurar que la base de datos se inicializa y loguea la ruta
-    
-    logger.info("--- Test de Conectividad AirDC++ ---")
-    try:
-        r = requests.get(f"{AIRDCPP_URL}/api/v1/hubs", headers=get_auth_headers(), timeout=5)
-        if r.status_code == 200:
-            logger.info("Conexión con AirDC++ establecida correctamente.")
-        else:
-            logger.warning(f"AirDC++ respondió con status {r.status_code}")
-    except Exception as e:
-        logger.error(f"Fallo de conexión: {e}")
 
-app.include_router(general.router)
-app.include_router(torznab.router)
-app.include_router(qbittorrent.router)
+def create_app(settings: Settings | None = None) -> FastAPI:
+    configured = settings or get_settings()
+    setup_logging(configured.log_level)
+    logger = logging.getLogger("app")
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        configured.validate_runtime()
+        repository = Repository(configured.db_path)
+        await repository.initialize()
+        timeout = httpx.Timeout(configured.search_timeout + 5, connect=5)
+        http = httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False)
+        airdcpp = AirDCClient(http, configured)
+        metadata = MetadataClient(http, configured.tmdb_api_key.get_secret_value())
+        cache = AsyncTTLCache(
+            configured.search_cache_ttl, configured.search_negative_cache_ttl, configured.search_cache_size
+        )
+        application.state.settings = configured
+        application.state.repository = repository
+        application.state.airdcpp = airdcpp
+        application.state.search_cache = cache
+        application.state.search_service = SearchService(airdcpp, metadata, repository, cache, configured)
+        logger.info("AirDC++ Bridge v2 iniciado; database=%s", configured.db_path)
+        yield
+        await http.aclose()
+
+    application = FastAPI(
+        title="AirDC++ Torznab/qBittorrent Bridge",
+        version="2.0.0-beta.1",
+        docs_url=None,
+        redoc_url=None,
+        lifespan=lifespan,
+    )
+
+    @application.middleware("http")
+    async def request_context(request: Request, call_next):
+        started = time.monotonic()
+        request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+        try:
+            response = await call_next(request)
+        except Exception:
+            logger.exception(
+                "request_id=%s method=%s path=%s error=unhandled", request_id, request.method, request.url.path
+            )
+            raise
+        response.headers["X-Request-ID"] = request_id
+        logger.info(
+            "request_id=%s method=%s path=%s status=%s duration_ms=%.1f",
+            request_id,
+            request.method,
+            request.url.path,
+            response.status_code,
+            (time.monotonic() - started) * 1000,
+        )
+        return response
+
+    application.include_router(general.router)
+    application.include_router(torznab.router)
+    application.include_router(qbittorrent.router)
+    return application
+
+
+app = create_app()

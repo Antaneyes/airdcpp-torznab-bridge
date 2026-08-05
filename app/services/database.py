@@ -1,137 +1,219 @@
-import sqlite3
 import json
-import os
-from contextlib import contextmanager
-from app.core.logging import get_logger
+import shutil
+import time
+from pathlib import Path
 
-logger = get_logger("app.database")
-# Ruta configurable vía entorno, por defecto la usada en el contenedor
-DATA_DIR = os.getenv("DATA_DIR", "/app/data")
-DB_PATH = os.path.join(DATA_DIR, "bridge.db")
+import aiosqlite
 
-def get_db_connection():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+from app.models import DownloadRecord, DownloadState, SearchResult
 
-@contextmanager
-def db_cursor(commit=False):
-    """Context manager para gestionar conexiones y transacciones de forma segura."""
-    conn = get_db_connection()
-    try:
-        if commit:
-            with conn:
-                yield conn
-        else:
-            yield conn
-    finally:
-        conn.close()
+SCHEMA_VERSION = 5
 
-def init_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    
-    if os.path.exists(DB_PATH):
-        try:
-            sizeKB = os.path.getsize(DB_PATH) / 1024
-            logger.info(f"Archivo de base de datos detectado en {DB_PATH}: {sizeKB:.2f} KB")
-        except Exception as e:
-            logger.warning(f"No se pudo determinar el tamaño de la DB: {e}")
-    else:
-        logger.warning(f"No se detectó base de datos previa en {DB_PATH}. Se creará una nueva.")
 
-    logger.info(f"Probando acceso a base de datos en: {os.path.abspath(DB_PATH)}")
-    
-    try:
-        with db_cursor(commit=True) as conn:
-            # Activar WAL mode para mejor concurrencia
-            conn.execute("PRAGMA journal_mode=WAL;")
-            
-            # Tabla 1: Mapeo TTH <-> Hex
-            conn.execute("""
+class Repository:
+    def __init__(self, path: Path):
+        self.path = path
+
+    async def initialize(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA foreign_keys=ON")
+            version_row = await (await db.execute("PRAGMA user_version")).fetchone()
+            version = int(version_row[0]) if version_row else 0
+            if self.path.stat().st_size > 0 and version < SCHEMA_VERSION:
+                backup = self.path.with_suffix(f".db.v{version}.bak-{int(time.time())}")
+                shutil.copy2(self.path, backup)
+            await db.executescript(
+                """
                 CREATE TABLE IF NOT EXISTS hashes (
                     tth TEXT PRIMARY KEY,
                     hex TEXT UNIQUE NOT NULL
                 );
-            """)
-            # Índice para buscar por hex rápido
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_hashes_hex ON hashes(hex);")
-
-            # Tabla 2: Bundles (Descargas activas/recientes)
-            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_hashes_hex ON hashes(hex);
                 CREATE TABLE IF NOT EXISTS bundles (
                     bundle_id TEXT PRIMARY KEY,
                     tth TEXT NOT NULL,
                     category TEXT DEFAULT 'radarr'
                 );
-            """)
-
-            # Tabla 3: Descargas finalizadas (Cache para Radarr)
-            conn.execute("""
                 CREATE TABLE IF NOT EXISTS finished (
                     tth TEXT PRIMARY KEY,
                     data TEXT NOT NULL
                 );
-            """)
-            
-        logger.info(f"Base de datos inicializada en {DB_PATH}")
-    except Exception as e:
-        logger.error(f"Error inicializando base de datos: {e}")
+                CREATE TABLE IF NOT EXISTS releases (
+                    release_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    tth TEXT,
+                    item_type TEXT NOT NULL,
+                    source_id TEXT,
+                    query TEXT NOT NULL,
+                    published_at INTEGER NOT NULL DEFAULT 0,
+                    availability INTEGER NOT NULL DEFAULT 1,
+                    languages TEXT NOT NULL DEFAULT '[]',
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS downloads (
+                    download_id TEXT PRIMARY KEY,
+                    release_id TEXT NOT NULL,
+                    bundle_id TEXT UNIQUE,
+                    category TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    size INTEGER NOT NULL DEFAULT 0,
+                    state TEXT NOT NULL,
+                    progress REAL NOT NULL DEFAULT 0,
+                    downloaded INTEGER NOT NULL DEFAULT 0,
+                    speed INTEGER NOT NULL DEFAULT 0,
+                    eta INTEGER NOT NULL DEFAULT 8640000,
+                    added_on INTEGER NOT NULL,
+                    completed_on INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY(release_id) REFERENCES releases(release_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_downloads_bundle ON downloads(bundle_id);
+                CREATE INDEX IF NOT EXISTS idx_downloads_category ON downloads(category);
+                """
+            )
+            columns = {row[1] for row in await (await db.execute("PRAGMA table_info(releases)")).fetchall()}
+            if "published_at" not in columns:
+                await db.execute("ALTER TABLE releases ADD COLUMN published_at INTEGER NOT NULL DEFAULT 0")
+            if "availability" not in columns:
+                await db.execute("ALTER TABLE releases ADD COLUMN availability INTEGER NOT NULL DEFAULT 1")
+            if "languages" not in columns:
+                await db.execute("ALTER TABLE releases ADD COLUMN languages TEXT NOT NULL DEFAULT '[]'")
+            await self._migrate_legacy(db)
+            await db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            await db.commit()
 
-# Funciones Helper para operaciones atómicas
+    async def _migrate_legacy(self, db: aiosqlite.Connection) -> None:
+        rows = await (await db.execute("SELECT bundle_id, tth, category FROM bundles")).fetchall()
+        for bundle_id, tth, category in rows:
+            hex_row = await (await db.execute("SELECT hex FROM hashes WHERE tth=?", (tth,))).fetchone()
+            if not hex_row:
+                continue
+            release_id = hex_row[0]
+            finished_row = await (await db.execute("SELECT data FROM finished WHERE tth=?", (tth,))).fetchone()
+            data = json.loads(finished_row[0]) if finished_row else {}
+            name = data.get("name", f"legacy-{bundle_id}")
+            size = int(data.get("size", 0))
+            await db.execute(
+                """INSERT OR IGNORE INTO releases
+                (release_id,name,size,tth,item_type,source_id,query,published_at,availability,languages,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (release_id, name, size, tth, "file", None, "legacy", 0, 1, "[]", int(time.time())),
+            )
+            state = DownloadState.COMPLETED if finished_row else DownloadState.QUEUED
+            await db.execute(
+                """INSERT OR IGNORE INTO downloads
+                (download_id,release_id,bundle_id,category,name,size,state,progress,downloaded,speed,eta,added_on,completed_on)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    release_id,
+                    release_id,
+                    bundle_id,
+                    category or "radarr",
+                    name,
+                    size,
+                    state,
+                    float(data.get("progress", 1 if finished_row else 0)),
+                    int(data.get("downloaded", size if finished_row else 0)),
+                    0,
+                    0 if finished_row else 8640000,
+                    int(data.get("added_on", time.time())),
+                    int(data.get("completion_on", 0)),
+                ),
+            )
 
-def db_get_hex(tth):
-    with db_cursor() as conn:
-        row = conn.execute("SELECT hex FROM hashes WHERE tth = ?", (tth,)).fetchone()
-        return row["hex"] if row else None
+    async def count_hashes(self) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            row = await (await db.execute("SELECT COUNT(*) FROM hashes")).fetchone()
+            return int(row[0]) if row else 0
 
-def db_save_hex(tth, hex_str):
-    with db_cursor(commit=True) as conn:
-        conn.execute("INSERT OR IGNORE INTO hashes (tth, hex) VALUES (?, ?)", (tth, hex_str))
+    async def save_hash(self, tth: str, hex_hash: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("INSERT OR IGNORE INTO hashes(tth,hex) VALUES(?,?)", (tth, hex_hash))
+            await db.commit()
 
-def db_get_tth_by_hex(hex_str):
-    with db_cursor() as conn:
-        row = conn.execute("SELECT tth FROM hashes WHERE hex = ?", (hex_str,)).fetchone()
-        return row["tth"] if row else None
+    async def tth_for_hash(self, hex_hash: str) -> str | None:
+        async with aiosqlite.connect(self.path) as db:
+            row = await (await db.execute("SELECT tth FROM hashes WHERE hex=?", (hex_hash,))).fetchone()
+            return row[0] if row else None
 
-def db_get_bundle(bundle_id):
-    with db_cursor() as conn:
-        row = conn.execute("SELECT tth, category FROM bundles WHERE bundle_id = ?", (bundle_id,)).fetchone()
-        return dict(row) if row else None
+    async def save_release(self, result: SearchResult) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """INSERT OR REPLACE INTO releases
+                (release_id,name,size,tth,item_type,source_id,query,published_at,availability,languages,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    result.release_id,
+                    result.name,
+                    result.size,
+                    result.tth,
+                    result.item_type,
+                    str(result.source_id) if result.source_id is not None else None,
+                    result.query,
+                    result.published_at,
+                    result.availability,
+                    json.dumps(result.languages),
+                    int(time.time()),
+                ),
+            )
+            await db.commit()
 
-def db_get_bundle_ids_by_tth(tth):
-    with db_cursor() as conn:
-        rows = conn.execute("SELECT bundle_id FROM bundles WHERE tth = ?", (tth,)).fetchall()
-        return [r["bundle_id"] for r in rows]
+    async def get_release(self, release_id: str) -> SearchResult | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            row = await (await db.execute("SELECT * FROM releases WHERE release_id=?", (release_id,))).fetchone()
+            if not row:
+                return None
+            data = {
+                k: row[k]
+                for k in (
+                    "release_id",
+                    "name",
+                    "size",
+                    "tth",
+                    "item_type",
+                    "source_id",
+                    "query",
+                    "published_at",
+                )
+            }
+            data["availability"] = row["availability"]
+            data["languages"] = json.loads(row["languages"])
+            return SearchResult(**data)
 
-def db_save_bundle(bundle_id, tth, category):
-    with db_cursor(commit=True) as conn:
-        conn.execute("INSERT OR REPLACE INTO bundles (bundle_id, tth, category) VALUES (?, ?, ?)", (bundle_id, tth, category))
+    async def save_download(self, record: DownloadRecord) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """INSERT OR REPLACE INTO downloads VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                tuple(record.model_dump().values()),
+            )
+            await db.commit()
 
-def db_save_finished(tth, data_dict):
-    json_str = json.dumps(data_dict)
-    with db_cursor(commit=True) as conn:
-        conn.execute("INSERT OR REPLACE INTO finished (tth, data) VALUES (?, ?)", (tth, json_str))
+    async def list_downloads(self, category: str | None = None) -> list[DownloadRecord]:
+        query = "SELECT * FROM downloads WHERE state != 'removed'"
+        params: tuple[str, ...] = ()
+        if category:
+            query += " AND lower(category)=lower(?)"
+            params = (category,)
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await (await db.execute(query, params)).fetchall()
+            return [DownloadRecord(**dict(row)) for row in rows]
 
-def db_get_finished(tth):
-    with db_cursor() as conn:
-        row = conn.execute("SELECT data FROM finished WHERE tth = ?", (tth,)).fetchone()
-        if row:
-            return json.loads(row["data"])
-        return None
+    async def get_download(self, download_id: str) -> DownloadRecord | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            row = await (await db.execute("SELECT * FROM downloads WHERE download_id=?", (download_id,))).fetchone()
+            return DownloadRecord(**dict(row)) if row else None
 
-def db_get_all_finished():
-    with db_cursor() as conn:
-        rows = conn.execute("SELECT tth, data FROM finished").fetchall()
-        results = {}
-        for r in rows:
-            results[r["tth"]] = json.loads(r["data"])
-        return results
+    async def mark_removed(self, download_id: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("UPDATE downloads SET state='removed' WHERE download_id=?", (download_id,))
+            await db.commit()
 
-def db_delete_finished(tth):
-    with db_cursor(commit=True) as conn:
-        conn.execute("DELETE FROM finished WHERE tth = ?", (tth,))
-
-def db_count_hashes():
-    with db_cursor() as conn:
-        row = conn.execute("SELECT Count(*) as count FROM hashes").fetchone()
-        return row["count"] if row else 0
+    async def update_category(self, download_id: str, category: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("UPDATE downloads SET category=? WHERE download_id=?", (category, download_id))
+            await db.commit()

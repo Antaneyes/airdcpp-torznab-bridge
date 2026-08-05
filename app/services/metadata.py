@@ -1,232 +1,141 @@
-import requests
+import logging
 import re
-from app.config import TMDB_API_KEY
-from app.core.logging import get_logger
+from dataclasses import dataclass, field
 
-logger = get_logger("app.metadata")
-logger.info(f"Configuración de metadatos cargada. TMDB_API_KEY detectada: {'SÍ' if TMDB_API_KEY else 'NO'}")
+import httpx
 
-TITLE_CACHE = {} # Mapeo de ID -> [Nombres]
+logger = logging.getLogger(__name__)
 
-def resolve_titles_by_id(imdbid=None, tvdbid=None, tmdbid=None):
-    """Consulta nombres alternativos por ID priorizando TMDB (para español) y usando TVMaze como fallback."""
-    key = imdbid or (f"tvdb_{tvdbid}" if tvdbid else None) or (f"tmdb_{tmdbid}" if tmdbid else None)
-    if not key: return []
-    
-    if key in TITLE_CACHE:
-        return TITLE_CACHE[key]
-    
-    titles = []
-    
-    # 1. Intentar TMDB primero (Mucho mejor para español)
-    if TMDB_API_KEY:
-        titles = resolve_titles_via_tmdb(imdbid=imdbid, tmdbid=tmdbid)
-        if titles:
-            logger.debug(f"TMDB encontró nombres para {key}: {titles}")
-            
-    # 2. Usar TVMaze para obtener más alias o si TMDB falló
-    try:
-        url = ""
-        if imdbid:
-            url = f"https://api.tvmaze.com/lookup/shows?imdb={imdbid}"
-        elif tvdbid:
-            url = f"https://api.tvmaze.com/lookup/shows?thetvdb={tvdbid}"
-            
-        if url:
-            logger.debug(f"Consultando TVMaze para ID: {key} (Complemento)")
-            r = requests.get(url, timeout=5)
-            if r.status_code == 200:
-                data = r.json()
-                tvmaze_titles = extract_titles_from_tvmaze_show(data)
-                # Añadir los que no tengamos ya
-                for t in tvmaze_titles:
-                    if t not in titles:
-                        titles.append(t)
-            elif r.status_code == 404 and (imdbid or tvdbid):
-                logger.debug(f"ID {key} no encontrado en TVMaze.")
-    except Exception as e:
-        logger.error(f"Error resolviendo títulos por ID en TVMaze: {e}")
-        
-    if titles:
-        # Poner los títulos de TMDB (probablemente español) al principio
-        TITLE_CACHE[key] = titles
-            
-    return titles
 
-def resolve_titles_via_tmdb(imdbid=None, tmdbid=None, query=None, year=None):
-    """Consulta nombres en español usando TheMovieDB (TMDB)."""
-    if not TMDB_API_KEY: return []
-    
-    titles = []
-    try:
-        base_url = "https://api.themoviedb.org/3"
-        r = None
-        
-        if tmdbid:
-            # Búsqueda directa por ID de TMDB (peli o serie)
-            r = requests.get(f"{base_url}/movie/{tmdbid}?api_key={TMDB_API_KEY}&language=es-ES&append_to_response=alternative_titles,translations", timeout=5)
-            if r.status_code != 200:
-                r = requests.get(f"{base_url}/tv/{tmdbid}?api_key={TMDB_API_KEY}&language=es-ES&append_to_response=alternative_titles,translations", timeout=5)
-        elif imdbid:
-            # Búsqueda por External ID (IMDB)
-            find_url = f"{base_url}/find/{imdbid}?api_key={TMDB_API_KEY}&language=es-ES&external_source=imdb_id"
-            fr = requests.get(find_url, timeout=5)
-            if fr.status_code == 200:
-                fdata = fr.json()
-                results = fdata.get("movie_results", []) or fdata.get("tv_results", [])
-                if results:
-                    show_id = results[0]["id"]
-                    is_tv = "tv_results" in fdata and fdata["tv_results"]
-                    type_str = "tv" if is_tv else "movie"
-                    r = requests.get(f"{base_url}/{type_str}/{show_id}?api_key={TMDB_API_KEY}&language=es-ES&append_to_response=alternative_titles,translations", timeout=5)
-        elif query:
-            # Búsqueda por nombre. Si hay año, ayuda mucho a la precisión.
-            search_params = {
-                "api_key": TMDB_API_KEY,
-                "language": "es-ES",
-                "query": query,
-                "include_adult": "false"
-            }
-            if year:
-                # Probamos primero como película con año
-                search_url = f"{base_url}/search/movie"
-                search_params["primary_release_year"] = year
-                sr = requests.get(search_url, params=search_params, timeout=5)
-                if sr.status_code == 200 and sr.json().get("results"):
-                    results = sr.json()["results"]
-                else:
-                    # Si falla o no hay resultados, probamos multi-search (incluye series)
-                    search_url = f"{base_url}/search/multi"
-                    if "primary_release_year" in search_params: del search_params["primary_release_year"]
-                    search_params["query"] = f"{query} {year}"
-                    sr = requests.get(search_url, params=search_params, timeout=5)
-                    results = sr.json().get("results", [])
-            else:
-                search_url = f"{base_url}/search/multi"
-                sr = requests.get(search_url, params=search_params, timeout=5)
-                results = sr.json().get("results", [])
+@dataclass
+class MediaMetadata:
+    titles: list[str] = field(default_factory=list)
+    localized_title: str | None = None
+    original_title: str | None = None
+    original_language: str | None = None
 
-            if results:
-                show_id = results[0]["id"]
-                media_type = results[0].get("media_type", "movie")
-                r = requests.get(f"{base_url}/{media_type}/{show_id}?api_key={TMDB_API_KEY}&language=es-ES&append_to_response=alternative_titles,translations", timeout=5)
 
-        if r and r.status_code == 200:
-            data = r.json()
-            # 1. Nombre principal en español
-            name = data.get("title") or data.get("name")
-            if name: titles.append(name)
-            
-            # 2. Títulos alternativos en España (Solo Castellano)
-            alt = data.get("alternative_titles", {})
-            alt_list = alt.get("titles", []) or alt.get("results", [])
-            for a in alt_list:
-                # Solo queremos títulos de España que sean en castellano (es)
-                if a.get("iso_3166_1") == "ES":
-                    lang = a.get("iso_639_1", "es") 
-                    if lang == "es":
-                        t = a.get("title") or a.get("name")
-                        if t and t not in titles: titles.append(t)
-            
-            # 3. Traducciones (Solo Castellano)
-            trans = data.get("translations", {}).get("translations", [])
-            for tr in trans:
-                if tr.get("iso_3166_1") == "ES" and tr.get("iso_639_1") == "es":
-                    t = tr.get("data", {}).get("title") or tr.get("data", {}).get("name")
-                    if t and t not in titles: titles.append(t)
-            
-            logger.info(f"TMDB resolvió para '{query or tmdbid or imdbid}' (Filtrado Español): {titles}")
-    except Exception as e:
-        logger.error(f"Error en TMDB: {e}")
-        
-    return titles
+class MetadataClient:
+    def __init__(self, client: httpx.AsyncClient, tmdb_api_key: str = ""):
+        self.client = client
+        self.tmdb_api_key = tmdb_api_key
+        self._cache: dict[str, MediaMetadata] = {}
 
-def resolve_titles_by_name(query):
-    """Intenta encontrar una serie/peli por nombre y sacar sus AKAs."""
-    # 1. Limpiar el nombre y detectar año
-    year_match = re.search(r'\s(\d{4})$', query)
-    detected_year = year_match.group(1) if year_match else None
-    
-    clean_q = query.split("(")[0].strip()
-    clean_q = re.sub(r'\s\d{4}$', '', clean_q).strip()
-    
-    if clean_q in TITLE_CACHE:
-        return TITLE_CACHE[clean_q]
-        
-    # 1. Intentar TMDB primero si hay KEY (es mucho mejor para pelis)
-    if TMDB_API_KEY:
-        titles = resolve_titles_via_tmdb(query=clean_q, year=detected_year)
-        if titles:
-            TITLE_CACHE[clean_q] = titles
-            return titles
+    async def titles(
+        self,
+        query: str | None,
+        imdb_id: str | None = None,
+        tmdb_id: str | None = None,
+        tvdb_id: str | None = None,
+        media_type: str | None = None,
+    ) -> list[str]:
+        return (await self.details(query, imdb_id, tmdb_id, tvdb_id, media_type)).titles
 
-    # 2. Si no hay TMDB o falló, vamos a TVMaze
-    titles = []
-    try:
-        logger.debug(f"Buscando en TVMaze por nombre: '{clean_q}'")
-        url = f"https://api.tvmaze.com/singlesearch/shows?q={clean_q}"
-        r = requests.get(url, timeout=5)
-        if r.status_code == 200:
-            data = r.json()
-            titles = extract_titles_from_tvmaze_show(data)
-    except Exception as e:
-        logger.error(f"Error resolviendo títulos por nombre: {e}")
+    async def details(
+        self,
+        query: str | None,
+        imdb_id: str | None = None,
+        tmdb_id: str | None = None,
+        tvdb_id: str | None = None,
+        media_type: str | None = None,
+    ) -> MediaMetadata:
+        key = "|".join(str(v or "") for v in (query, imdb_id, tmdb_id, tvdb_id, media_type))
+        if key in self._cache:
+            return self._cache[key]
+        found: list[str] = []
+        tmdb = MediaMetadata()
+        if self.tmdb_api_key:
+            tmdb = await self._tmdb_details(query, imdb_id, tmdb_id, media_type)
+            found.extend(tmdb.titles)
+        if imdb_id or tvdb_id:
+            found.extend(await self._tvmaze_titles(imdb_id, tvdb_id))
+        if query:
+            found.append(query)
+        unique = list(dict.fromkeys(t.strip() for t in found if t and t.strip()))
+        metadata = MediaMetadata(unique, tmdb.localized_title, tmdb.original_title, tmdb.original_language)
+        self._cache[key] = metadata
+        return metadata
 
-    if titles:
-        logger.info(f"Títulos encontrados por nombre para '{clean_q}': {titles}")
-        TITLE_CACHE[clean_q] = titles
-    
-    is_series_match = titles and ":" in titles[0] and ":" not in clean_q
-    
-    if not titles or is_series_match:
-        guess = translate_title_to_spanish(clean_q)
-        if guess and guess.lower() != clean_q.lower():
-            if guess not in titles:
-                logger.debug(f"Agregando adivinanza en español: '{guess}'")
-                titles.append(guess)
-                TITLE_CACHE[clean_q] = titles
-            
-    return titles
+    async def _tmdb_titles(self, imdb_id: str | None, tmdb_id: str | None, media_type: str | None) -> list[str]:
+        return (await self._tmdb_details(None, imdb_id, tmdb_id, media_type)).titles
 
-def translate_title_to_spanish(text):
-    """Fallback simple usando MyMemory (Gratuito/Sin Key) para adivinar el nombre en español."""
-    try:
-        url = f"https://api.mymemory.translated.net/get?q={text}&langpair=en|es"
-        r = requests.get(url, timeout=3)
-        if r.status_code == 200:
-            data = r.json()
-            translated = data.get("responseData", {}).get("translatedText")
-            if translated and len(translated) > 1:
-                return translated.replace('"', '').replace("'", "").strip()
-    except:
-        pass
-    return None
+    async def _tmdb_details(
+        self,
+        query: str | None,
+        imdb_id: str | None,
+        tmdb_id: str | None,
+        media_type: str | None,
+    ) -> MediaMetadata:
+        try:
+            kind = "tv" if media_type == "tv" else "movie"
+            item_id = tmdb_id
+            if imdb_id:
+                response = await self.client.get(
+                    f"https://api.themoviedb.org/3/find/{imdb_id}",
+                    params={"api_key": self.tmdb_api_key, "external_source": "imdb_id", "language": "es-ES"},
+                )
+                response.raise_for_status()
+                payload = response.json()
+                matches = payload.get("tv_results") if media_type == "tv" else payload.get("movie_results")
+                matches = matches or payload.get("movie_results") or payload.get("tv_results") or []
+                if not matches:
+                    return MediaMetadata()
+                item_id = str(matches[0]["id"])
+                kind = "tv" if payload.get("tv_results") and matches is payload.get("tv_results") else "movie"
+            if not item_id and query:
+                year_match = re.search(r"(?:\s|\()(\d{4})(?:\)|$)", query)
+                search_query = re.sub(r"\s*\(?\d{4}\)?\s*$", "", query).strip()
+                params = {"api_key": self.tmdb_api_key, "query": search_query, "language": "es-ES"}
+                if year_match:
+                    params["year" if kind == "movie" else "first_air_date_year"] = year_match.group(1)
+                search = await self.client.get(
+                    f"https://api.themoviedb.org/3/search/{kind}",
+                    params=params,
+                )
+                search.raise_for_status()
+                matches = search.json().get("results", [])
+                if matches:
+                    item_id = str(matches[0]["id"])
+            if not item_id:
+                return MediaMetadata()
+            response = await self.client.get(
+                f"https://api.themoviedb.org/3/{kind}/{item_id}",
+                params={"api_key": self.tmdb_api_key, "language": "es-ES", "append_to_response": "alternative_titles"},
+            )
+            response.raise_for_status()
+            data = response.json()
+            localized = data.get("title") or data.get("name")
+            original = data.get("original_title") or data.get("original_name")
+            titles = [localized, original]
+            alternatives = data.get("alternative_titles", {}).get("titles", []) or data.get(
+                "alternative_titles", {}
+            ).get("results", [])
+            titles.extend(
+                (v.get("title") or v.get("name")) for v in alternatives if v.get("iso_3166_1") in {None, "ES"}
+            )
+            return MediaMetadata([t for t in titles if t], localized, original, data.get("original_language"))
+        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            logger.warning("No se pudieron obtener metadatos de TMDB: %s", exc)
+            return MediaMetadata()
 
-def extract_titles_from_tvmaze_show(show_data):
-    """Extrae nombre principal y AKAs de un objeto show de TVMaze, priorizando español."""
-    spanish_titles = []
-    other_titles = []
-    try:
-        main_name = show_data.get("name")
-        if main_name:
-            other_titles.append(main_name)
-        
-        show_id = show_data.get("id")
-        if show_id:
-            ak_res = requests.get(f"https://api.tvmaze.com/shows/{show_id}/akas", timeout=5)
-            if ak_res.status_code == 200:
-                akas = ak_res.json()
-                for ak in akas:
-                    name = ak.get("name")
-                    if not name: continue
-                    
-                    if (ak.get("country") or {}).get("code") == "ES":
-                        if name not in spanish_titles:
-                            spanish_titles.append(name)
-                    elif not ak.get("country"): # Alias general
-                        if name not in other_titles and name not in spanish_titles:
-                            other_titles.append(name)
-    except Exception as e:
-        logger.error(f"Error extrayendo títulos: {e}")
-    
-    return spanish_titles + [t for t in other_titles if t not in spanish_titles]
+    async def _tvmaze_titles(self, imdb_id: str | None, tvdb_id: str | None) -> list[str]:
+        try:
+            params = {"imdb" if imdb_id else "thetvdb": imdb_id or tvdb_id}
+            response = await self.client.get("https://api.tvmaze.com/lookup/shows", params=params)
+            if response.status_code == 404:
+                return []
+            response.raise_for_status()
+            show = response.json()
+            titles = [show.get("name")]
+            if show.get("id"):
+                aliases = await self.client.get(f"https://api.tvmaze.com/shows/{show['id']}/akas")
+                aliases.raise_for_status()
+                titles.extend(
+                    a.get("name")
+                    for a in aliases.json()
+                    if not a.get("country") or a.get("country", {}).get("code") == "ES"
+                )
+            return [t for t in titles if t]
+        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            logger.warning("No se pudieron obtener metadatos de TVMaze: %s", exc)
+            return []

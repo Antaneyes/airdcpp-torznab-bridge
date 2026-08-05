@@ -1,28 +1,38 @@
-from fastapi import APIRouter
-from fastapi.responses import RedirectResponse
-from app.services.persistence import HASH_MAP_TTH_TO_HEX, HASH_MAP_HEX_TO_TTH, db_count_hashes
-from app.core.logging import get_logger
+import urllib.parse
 
-logger = get_logger("app.routers.general")
+from fastapi import APIRouter, Request, Response
+
+from app.utils.xml import COMPAT_TRACKER, error_xml
 
 router = APIRouter()
 
-@router.get("/health")
-async def health():
-    return {"status": "ok", "hashes": db_count_hashes()}
 
-@router.get("/download/{fake_hash}")
-@router.get("/download/{fake_hash}.torrent") # Soportar ambas formas
-async def download_redirect(fake_hash: str, name: str = "file"):
-    logger.info(f"Radarr GRAB detectado para: {name} (Hex: {fake_hash})")
-    
-    # Strip .torrent if present
-    if fake_hash.endswith(".torrent"):
-        fake_hash = fake_hash[:-8]
-        
-    # tth = HASH_MAP_HEX_TO_TTH.get(fake_hash, fake_hash) # No se usa en magnet pero si en logica
-    # También aquí para consistencia
-    magnet = f"magnet:?xt=urn:btih:{fake_hash}&dn={name}&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce"
-    
-    # Redirección 301 (Permanente) para máxima compatibilidad con el grabber de Radarr
-    return RedirectResponse(url=magnet, status_code=301)
+@router.get("/health")
+@router.get("/health/live")
+async def live(request: Request) -> dict:
+    return {"status": "ok", "version": "2.0.0-beta.1", "hashes": await request.app.state.repository.count_hashes()}
+
+
+@router.get("/health/ready")
+async def ready(request: Request) -> Response:
+    ok = await request.app.state.airdcpp.ready()
+    return Response(
+        content='{"status":"ready"}' if ok else '{"status":"unavailable"}',
+        status_code=200 if ok else 503,
+        media_type="application/json",
+    )
+
+
+@router.get("/download/{release_id}")
+@router.get("/download/{release_id}.torrent")
+async def download_redirect(request: Request, release_id: str, name: str = "file", apikey: str = "") -> Response:
+    if release_id.endswith(".torrent"):
+        release_id = release_id[:-8]
+    settings = request.app.state.settings
+    if not (settings.allow_insecure or settings.testing) and apikey != settings.bridge_api_key.get_secret_value():
+        return Response(error_xml(100, "API key inválida"), status_code=401, media_type="application/xml")
+    if not await request.app.state.repository.get_release(release_id):
+        return Response("Resultado caducado o desconocido", status_code=404)
+    tracker = urllib.parse.quote(COMPAT_TRACKER, safe="")
+    magnet = f"magnet:?xt=urn:btih:{release_id}&dn={urllib.parse.quote(name, safe='')}&tr={tracker}"
+    return Response(status_code=302, headers={"Location": magnet})

@@ -1,102 +1,85 @@
-# AirDC++ Bridge para Radarr y Sonarr
+# AirDC++ Torznab Bridge
 
-Este proyecto actúa como un puente (bridge) entre **AirDC++** y las aplicaciones de la familia *Arr (Radarr y Sonarr), emulando los APIs de qBittorrent (para descargas) y Torznab (para búsquedas).
+Puente compatible con Torznab y con el subconjunto de la Web API de qBittorrent que usan Radarr y Sonarr. Permite
+buscar contenido en los hubs de AirDC++, iniciar la descarga y seguir su estado desde Arr.
 
-## 🚀 Características Principales
+> La versión 2 está en beta. No expongas el servicio directamente a Internet.
 
-- **Resolución de Títulos Avanzada**: Utiliza **TMDB** (TheMovieDB) y TVMaze para obtener nombres en español y alias exactos.
-- **Normalización de Acentos**: Genera automáticamente variantes con y sin acentos para máxima compatibilidad con hubs.
-- **Búsqueda Robusta**: Realiza búsquedas por nombre exacto y verifica el TTH para asegurar que descargas lo que elegiste.
-- **Persistencia en SQLite**: Migración de JSON a una base de datos SQLite más robusta y eficiente.
-- **Caché de XML**: Respuestas casi instantáneas para búsquedas repetitivas de Radarr/Sonarr.
-- **Seguimiento en Tiempo Real**: API de qBittorrent optimizada para una importación instantánea y visibilidad completa de la cola.
-- **Borrado Sincronizado**: Al borrar una descarga en Radarr/Sonarr, se elimina automáticamente del cliente AirDC++.
+## Características
 
-## 🛠️ Instalación y Uso
+- Búsquedas Torznab de películas, episodios y temporadas.
+- Resolución opcional de títulos mediante TMDB y TVMaze, sin traducciones automáticas inventadas.
+- Adaptador qBittorrent con categorías configurables; incluye `radarr`, `sonarr`, `radarr4k` y `sonarr4k` por defecto.
+- Persistencia SQLite y migración automática del esquema anterior.
+- Autenticación independiente para Torznab, Arr y AirDC++.
+- Caché, coalescencia y límite global para no inundar los hubs con búsquedas repetidas.
+- Resultado sintético claramente identificado únicamente para la consulta vacía con la que Arr valida el indexador.
+- Imágenes Docker `linux/amd64` y `linux/arm64`.
 
-La forma más sencilla de ejecutar el bridge es mediante **Docker Compose**.
+## Instalación beta
 
-### 1. Preparar la Configuración
-Crea un archivo llamado `.env` en la misma carpeta que el `docker-compose.yml` con el siguiente contenido:
-
-```env
-# URL de la API de AirDC++ (usar host.docker.internal para acceder al host desde el contenedor)
-AIRDCPP_URL=http://host.docker.internal:5600
-AIRDCPP_USER=tu_usuario
-AIRDCPP_PASS=tu_password
-
-# Opcional pero recomendado para resolución de nombres en español
-TMDB_API_KEY=tu_api_key_aqui
-
-# Ruta donde se descargan los archivos (visto por Sonarr/Radarr en su contenedor)
-SAVE_PATH=/downloads
-```
-
-
-- **Importante**: Añade tu `TMDB_API_KEY` para que el bridge pueda encontrar los nombres de las películas en español.
-
-### 2. Archivo `docker-compose.yml`
-Crea un archivo llamado `docker-compose.yml` (o `compose.yaml`) con el siguiente contenido:
-
-```yaml
-version: '3.8'
-
-services:
-  airdcpp-bridge:
-    # OPCIÓN A: Versión Estable (Recomendada)
-    image: ghcr.io/antaneyes/airdcpp-torznab-bridge:latest
-    
-    # OPCIÓN B: Versión de Desarrollo (Novedades)
-    # image: ghcr.io/antaneyes/airdcpp-torznab-bridge:dev
-
-    # OPCIÓN C: Desarrollo Local (Construir desde el código)
-    # build: . 
-    
-    container_name: airdcpp-bridge
-    ports:
-      - 8000:8000
-    environment:
-      - AIRDCPP_URL=${AIRDCPP_URL}
-      - AIRDCPP_USER=${AIRDCPP_USER}
-      - AIRDCPP_PASS=${AIRDCPP_PASS}
-      - TMDB_API_KEY=${TMDB_API_KEY}
-      - SAVE_PATH=${SAVE_PATH}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    volumes:
-      - ./data:/app/data
-    restart: always
-```
-
-### 3. Levantar el servicio
 ```bash
+cp .env.example .env
+# Edita .env y usa secretos aleatorios largos.
+docker compose up -d --build
+curl http://localhost:8001/health/live
+```
+
+La beta usa el puerto `8001` y el volumen Docker `bridge-v2-data`, por lo que puede convivir con una instalación
+anterior. Para migrar el estado, arranca la beta una vez, detenla y copia la base con:
+
+```bash
+docker compose stop
+docker run --rm -v airdcpp-torznab-bridge_bridge-v2-data:/target \
+  -v /ruta/a/la/base/anterior:/source:ro busybox \
+  sh -c 'cp /source/bridge.db /target/bridge.db && chown 10001:10001 /target/bridge.db'
 docker compose up -d
 ```
 
-> [!TIP]
-> Si quieres probar las últimas funciones antes de que salgan a la versión principal, cambia la etiqueta de la imagen de `:latest` a `:dev` y ejecuta `docker compose pull && docker compose up -d`.
+La migración crea automáticamente una copia `bridge.db.v0.bak-*` antes de modificar el esquema.
 
-> [!WARNING]
-> Con cada actualización, asegúrate de revisar si hay nuevas variables en el `.env.example` y de actualizar tu `docker-compose.yml` para incluirlas en la sección `environment`. Si falta alguna variable obligatoria, el bridge podría no funcionar correctamente.
+### Radarr y Sonarr
 
-## ⚙️ Configuración en Radarr/Sonarr
+Indexer Torznab:
 
-### 1. Indexador (Torznab)
-- **URL**: `http://tu-ip:8000/torznab`
-- **API Key**: (Cualquier valor)
-- **Categorías**: 5000 (TV), 2000 (Movies).
+- URL: `http://host:8001/torznab`
+- API key: el valor de `BRIDGE_API_KEY`
+- Categoría: `2000` para Radarr y `5000` para Sonarr
 
-### 2. Cliente de Descarga (qBittorrent)
-- **Host**: `tu-ip`
-- **Puerto**: `8000`
-- **Username/Password**: Los mismos configurados en el `.env`.
-- **Categoría**: `radarr` o `sonarr`.
+Cliente qBittorrent:
 
-## 📁 Estructura del Proyecto
+- Host/puerto: `host:8001`
+- Usuario/contraseña: `BRIDGE_USERNAME` y `BRIDGE_PASSWORD`
+- Categoría: una de las configuradas en `DOWNLOAD_CATEGORIES` (`radarr`, `sonarr`, `radarr4k` o `sonarr4k` por defecto)
 
-- `app/main.py`: Punto de entrada de la aplicación FastAPI.
-- `app/routers/`: Definición de los endpoints (Torznab, qBittorrent, General).
-- `app/services/`: Lógica de negocio (AirDC++, Base de Datos, Metadatos).
-- `app/core/`: Configuración global, logging y bloqueos.
-- `app/utils/`: Utilidades de texto y generación de XML.
-- `data/bridge.db`: Base de datos SQLite (creada automáticamente).
+Configura el Remote Path Mapping de Arr cuando `SAVE_PATH` no coincida con la ruta visible dentro de sus
+contenedores.
+
+## Configuración principal
+
+| Variable | Descripción | Predeterminado |
+| --- | --- | --- |
+| `AIRDCPP_URL` | URL de AirDC++ | `http://localhost:5600` |
+| `AIRDCPP_USER` / `AIRDCPP_PASS` | Credenciales de AirDC++ | obligatorias |
+| `BRIDGE_API_KEY` | Clave del indexador Torznab | obligatoria |
+| `BRIDGE_USERNAME` / `BRIDGE_PASSWORD` | Login qBittorrent de Arr | obligatorias |
+| `DOWNLOAD_CATEGORIES` | Categorías qBittorrent separadas por comas | `radarr,sonarr,radarr4k,sonarr4k` |
+| `TMDB_API_KEY` | Enriquecimiento opcional de títulos | vacío |
+| `SAVE_PATH` | Ruta que se anuncia a Arr | `/downloads` |
+| `COMPLETED_RATIO` | Ratio virtual al completar | `1.5` |
+| `ALLOW_FILE_DELETE` | Permite solicitar borrado al retirar | `false` |
+| `AIRDCPP_MAX_ACTIVE_SEARCHES` | Búsquedas AirDC++ simultáneas | `1` |
+| `SEARCH_TIMEOUT` | Espera máxima por variante | `10` segundos |
+| `ALLOW_INSECURE` | Desactiva autenticación; solo para redes aisladas | `false` |
+
+## Desarrollo
+
+```bash
+python -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/ruff check .
+.venv/bin/pyright
+.venv/bin/pytest --cov=app
+```
+
+Licencia: [GPL-3.0](LICENSE).

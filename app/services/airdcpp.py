@@ -1,229 +1,208 @@
+import asyncio
 import base64
-import re
+import hashlib
+import logging
 import time
-import requests
-from concurrent.futures import ThreadPoolExecutor
-from app.config import AIRDCPP_URL, AIRDCPP_USER, AIRDCPP_PASS, KNOWN_CATEGORIES, CATEGORY_PROFILES
-from app.utils.text import normalize_text, clean_search_pattern
-from app.services.persistence import BUNDLE_MAP_ID_TO_TTH, BUNDLE_MAP_ID_TO_CAT, save_hashes
-from app.core.locks import GLOBAL_SEARCH_LOCK
 
-from app.core.logging import get_logger
+import httpx
 
-logger = get_logger("app.airdcpp")
+from app.config import Settings
+from app.models import SearchResult
+from app.utils.text import normalize_text, season_pattern
 
-def get_auth_headers():
-    if AIRDCPP_USER and AIRDCPP_PASS:
-        auth_str = f"{AIRDCPP_USER}:{AIRDCPP_PASS}"
-        encoded_auth = base64.b64encode(auth_str.encode()).decode()
-        return {"Authorization": f"Basic {encoded_auth}"}
-    return {}
+logger = logging.getLogger(__name__)
 
-def search_airdcpp(query_or_list, is_season_search=False, season_num=None, cat_profile="video"):
-    headers = get_auth_headers()
-    
-    # Obtener configuración del perfil
-    profile_cfg = CATEGORY_PROFILES.get(cat_profile, CATEGORY_PROFILES["generic"])
-    allowed_extensions = profile_cfg["extensions"]
-    min_size = profile_cfg["min_size_season"] if is_season_search else profile_cfg["min_size"]
-    
-    logger.info(f"Buscando con perfil '{cat_profile}' (Extensiones: {allowed_extensions or 'todas'}, MinSize: {min_size/1024/1024:.2f}MB)")
-    
-    # Preparamos el regex para filtrar por temporada si es necesario
-    season_regex = None
-    if is_season_search and season_num:
-        s_int = int(season_num)
-        pattern = rf'(?:[ST]|Temporada|Season|Staffel|Temp|Pt|Part|P)\s*[.\-_]?\s*0?{s_int}\b'
-        season_regex = re.compile(pattern, re.IGNORECASE)
-        logger.info(f"Filtro regex para temporada {season_num} activado: {pattern}")
-    
-    queries_to_try = query_or_list if isinstance(query_or_list, list) else [query_or_list]
 
-    # Expandir con fallbacks y LIMPIAR patrones (Doble Capa)
-    expanded_queries = []
-    for q in queries_to_try:
-        if not q: continue
-        
-        # 1. Capa Precisa: Título completo limpio
-        q_full = clean_search_pattern(q)
-        if q_full and q_full not in expanded_queries:
-            expanded_queries.append(q_full)
-            
-        # 2. Capa Auxiliar: Título corto (5 palabras) para capturar nombres abreviados
-        q_short = clean_search_pattern(q, max_words=5)
-        if q_short and q_short not in expanded_queries:
-            expanded_queries.append(q_short)
-        
-        # 3. Fallback sin año (también con doble capa)
-        match_year = re.search(r'\s(\d{4})$', q)
-        if match_year:
-            base_no_year = q.replace(match_year.group(0), "").strip()
-            
-            q_fallback_full = clean_search_pattern(base_no_year)
-            if q_fallback_full and q_fallback_full not in expanded_queries:
-                expanded_queries.append(q_fallback_full)
-                
-            q_fallback_short = clean_search_pattern(base_no_year, max_words=5)
-            if q_fallback_short and q_fallback_short not in expanded_queries:
-                expanded_queries.append(q_fallback_short)
-            
-    final_queries = list(dict.fromkeys(expanded_queries)) # Dedup preservando orden
-    logger.info(f"Variantes de búsqueda finales: {final_queries}")
+class AirDCError(RuntimeError):
+    pass
 
-    logger.info(f"Iniciando búsqueda AirDC++ con {len(final_queries)} variantes en paralelo")
-    all_results = []
-    
-    def search_variant(q_attempt):
-        variant_results = []
+
+class AirDCClient:
+    def __init__(self, http: httpx.AsyncClient, settings: Settings):
+        self.http = http
+        self.settings = settings
+        self.search_semaphore = asyncio.Semaphore(settings.airdcpp_max_active_searches)
+
+    @property
+    def headers(self) -> dict[str, str]:
+        token = base64.b64encode(
+            f"{self.settings.airdcpp_user}:{self.settings.airdcpp_pass.get_secret_value()}".encode()
+        ).decode()
+        return {"Authorization": f"Basic {token}"}
+
+    async def ready(self) -> bool:
         try:
-            logger.debug(f"Lanzando búsqueda paralela: '{q_attempt}'")
-            res = requests.post(f"{AIRDCPP_URL}/api/v1/search", json={}, headers=headers, timeout=10)
-            res.raise_for_status()
-            instance_id = res.json()["id"]
-            
-            query_data = {"pattern": q_attempt}
-            if is_season_search:
-                query_data["type_id"] = "directory"
-                query_data["size_min"] = 1024 * 1024 * 1024 # 1GB
-            
-            search_payload = {"query": query_data, "hub_urls": []}
-            requests.post(f"{AIRDCPP_URL}/api/v1/search/{instance_id}/hub_search", json=search_payload, headers=headers, timeout=10)
-            
-            raw_results = []
-            max_results = 2000
-            last_stable_count = -1
-            stable_cycles = 0
-            
-            for i in range(15):
-                time.sleep(1)
-                try:
-                    results_res = requests.get(f"{AIRDCPP_URL}/api/v1/search/{instance_id}/results/0/{max_results}", headers=headers, timeout=5)
-                    if results_res.status_code == 200:
-                        current_results = results_res.json()
-                        current_count = len(current_results)
-                        raw_results = current_results
-                        
-                        if current_count > 0:
-                            if current_count == last_stable_count:
-                                stable_cycles += 1
-                            else:
-                                stable_cycles = 0
-                                
-                            if stable_cycles >= 4:
-                                logger.info(f"Búsqueda '{q_attempt}' estabilizada en {current_count} resultados brutos.")
-                                break
-                        
-                        last_stable_count = current_count
-                except Exception:
-                    continue
-            
-            requests.delete(f"{AIRDCPP_URL}/api/v1/search/{instance_id}", headers=headers, timeout=5)
-            
-            # Filtros dinámicos por perfil
-            has_ep_pattern = re.search(r'[Ss]\d{2}[Ee]\d{2}', q_attempt)
-            
-            for r in raw_results:
-                name_raw = r["name"]
-                name_norm = normalize_text(name_raw)
-                name_lower = name_raw.lower()
-                
-                raw_type = r.get("type", "file")
-                item_type = raw_type.get("id", "file") if isinstance(raw_type, dict) else str(raw_type)
-                size_bytes = int(r["size"])
-                
-                if is_season_search:
-                    if item_type not in ["directory", "bundle"]: continue
-                    clean_name = name_norm.replace("-", " ").replace(".", " ").replace("_", " ")
-                    
-                    if season_regex:
-                        if not season_regex.search(clean_name): continue
-                    
-                    s_num = str(season_num or "").zfill(2)
-                    display_season_tag = f"S{s_num}"
-                    s_clean_pattern = rf'(?:[ST]|Temporada|Season|Staffel|Temp|Pt|Part|P)\s*[.\-_]?\s*0?{season_num}\b'
+            response = await self.http.get(f"{self.settings.airdcpp_url}/api/v1/hubs", headers=self.headers)
+            return response.status_code == 200
+        except httpx.HTTPError:
+            return False
 
-                    matched_alias = None
-                    for q in final_queries:
-                        if q.lower() in name_lower:
-                            matched_alias = q
-                            break
+    async def bundles(self) -> list[dict]:
+        try:
+            response = await self.http.get(
+                f"{self.settings.airdcpp_url}/api/v1/queue/bundles/0/1000", headers=self.headers
+            )
+            response.raise_for_status()
+            return response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise AirDCError(f"No se pudo consultar la cola de AirDC++: {exc}") from exc
 
-                    if matched_alias:
-                        if display_season_tag.lower() in name_lower:
-                            display_name = name_raw
-                        else:
-                            alias_lower = matched_alias.lower()
-                            idx = name_lower.find(alias_lower) + len(alias_lower)
-                            year_match = re.search(r'^\s*\(?\d{4}\)?', name_raw[idx:])
-                            if year_match: idx += len(year_match.group(0))
-                            
-                            prefix = name_raw[:idx].strip()
-                            suffix = name_raw[idx:].strip()
-                            suffix = re.sub(s_clean_pattern, '', suffix, flags=re.IGNORECASE).strip()
-                            suffix = re.sub(r'^[\s.\-_]+', '', suffix) 
-                            
-                            if suffix:
-                                display_name = f"{prefix} {display_season_tag} {suffix}"
-                            else:
-                                display_name = f"{prefix} {display_season_tag}"
-                    else:
-                        name_cleaned = re.sub(s_clean_pattern, '', name_raw, flags=re.IGNORECASE).strip()
-                        name_cleaned = re.sub(r'^[\s.\-_]+', '', name_cleaned)
-                        
-                        if name_cleaned:
-                            display_name = f"{final_queries[0]} {display_season_tag} - {name_raw}"
-                        else:
-                            display_name = f"{final_queries[0]} {display_season_tag}"
+    async def search(
+        self, variants: list[str], season: int | None = None, extensions: tuple[str, ...] = ()
+    ) -> list[SearchResult]:
+        collected: dict[str, SearchResult] = {}
+        async with self.search_semaphore:
+            for variant in variants:
+                for result in await self._search_once(variant, season, extensions):
+                    existing = collected.get(result.release_id)
+                    if not existing or len(result.name) > len(existing.name):
+                        collected[result.release_id] = result
+                if collected:
+                    break
+        return list(collected.values())
+
+    async def _search_once(self, query: str, season: int | None, extensions: tuple[str, ...]) -> list[SearchResult]:
+        instance_id: str | int | None = None
+        try:
+            response = await self.http.post(f"{self.settings.airdcpp_url}/api/v1/search", json={}, headers=self.headers)
+            response.raise_for_status()
+            instance_id = response.json()["id"]
+            query_data: dict[str, object] = {"pattern": query}
+            if season is not None:
+                query_data.update(type_id="directory", size_min=100 * 1024 * 1024)
+            response = await self.http.post(
+                f"{self.settings.airdcpp_url}/api/v1/search/{instance_id}/hub_search",
+                json={"query": query_data, "hub_urls": []},
+                headers=self.headers,
+            )
+            response.raise_for_status()
+            deadline = time.monotonic() + self.settings.search_timeout
+            raw: list[dict] = []
+            previous = -1
+            stable = 0
+            while time.monotonic() < deadline:
+                await asyncio.sleep(self.settings.search_poll_interval)
+                response = await self.http.get(
+                    f"{self.settings.airdcpp_url}/api/v1/search/{instance_id}/results/0/{self.settings.search_max_results}",
+                    headers=self.headers,
+                )
+                response.raise_for_status()
+                raw = response.json()
+                if raw and len(raw) == previous:
+                    stable += 1
+                    if stable >= self.settings.search_stable_cycles:
+                        break
                 else:
-                    if allowed_extensions and not name_lower.endswith(allowed_extensions): continue
-                    display_name = name_raw
-                
-                if size_bytes < min_size: continue
-                if has_ep_pattern and has_ep_pattern.group(0).lower() not in name_lower.replace(".", " ").replace("-", " "): continue
-                
-                tth = r.get("tth")
-                if not tth:
-                    if item_type in ["directory", "bundle"]:
-                        tth = f"SYNTH:{display_name}:{size_bytes}"
-                        logger.debug(f"Generado TTH sintético para carpeta: {tth}")
-                    else:
-                        continue
-                        
-                variant_results.append({"name": display_name, "size": size_bytes, "tth": tth})
-            
-            logger.info(f"  -> '{q_attempt}': {len(variant_results)} resultados válidos de {len(raw_results)} encontrados.")
-                
-        except Exception as e:
-            logger.error(f"Error en variante '{q_attempt}': {e}")
-        return variant_results
+                    stable = 0
+                previous = len(raw)
+            return self._convert_results(raw, query, season, extensions)
+        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            raise AirDCError(f"Falló la búsqueda '{query}': {exc}") from exc
+        finally:
+            if instance_id is not None:
+                try:
+                    await self.http.delete(
+                        f"{self.settings.airdcpp_url}/api/v1/search/{instance_id}", headers=self.headers
+                    )
+                except httpx.HTTPError:
+                    logger.warning("No se pudo eliminar la búsqueda AirDC++ %s", instance_id)
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = []
-        for q in final_queries:
-            futures.append(executor.submit(search_variant, q))
-            time.sleep(2.5) 
+    def _convert_results(
+        self, raw: list[dict], query: str, season: int | None, extensions: tuple[str, ...]
+    ) -> list[SearchResult]:
+        output: list[SearchResult] = []
+        season_re = season_pattern(season) if season is not None else None
+        for item in raw:
+            name = str(item.get("name", ""))
+            raw_type = item.get("type", "file")
+            item_type = str(raw_type.get("id", "file") if isinstance(raw_type, dict) else raw_type)
+            size = int(float(item.get("size", 0)))
+            if not name or size <= 0:
+                continue
+            if season_re and (item_type not in {"directory", "bundle"} or not season_re.search(normalize_text(name))):
+                continue
+            if not season_re and extensions and item_type == "file" and not name.lower().endswith(extensions):
+                continue
+            tth = item.get("tth")
+            users = item.get("users")
+            user_count = len(users) if isinstance(users, list | dict) else int(users or 0)
+            availability = max(1, int(item.get("hits", 0) or 0), user_count)
+            identity = str(tth or f"{normalize_text(name)}:{size}:{item_type}")
+            release_id = hashlib.sha1(identity.encode()).hexdigest()
+            output.append(
+                SearchResult(
+                    release_id=release_id,
+                    name=name,
+                    size=size,
+                    tth=tth,
+                    item_type=item_type,
+                    source_id=item.get("id"),
+                    query=query,
+                    published_at=max(0, int(float(item.get("time", 0) or 0))),
+                    availability=availability,
+                )
+            )
+        return output
 
-    for f in futures:
-        try:
-            res_list = f.result()
-            all_results.extend(res_list)
-        except Exception as e:
-            logger.error(f"Error recuperando resultados de futuro: {e}")
+    async def download(self, release: SearchResult) -> str:
+        return await self._search_and_download(release)
 
-    # Eliminar duplicados por TTH, pero PREFIRIENDO el nombre más largo/descriptivo
-    tth_groups = {}
-    for r in all_results:
-        tth = r.get("tth")
-        if not tth: continue
-        
-        if tth not in tth_groups:
-            tth_groups[tth] = r
-        else:
-            # Ganador simple: el nombre más largo
-            if len(r["name"]) > len(tth_groups[tth]["name"]):
-                tth_groups[tth] = r
-            
-    unique_results = list(tth_groups.values())
-            
-    logger.info(f"Búsqueda finalizada: {len(unique_results)} resultados únicos totales")
-    return unique_results
+    async def _search_and_download(self, release: SearchResult) -> str:
+        async with self.search_semaphore:
+            instance_id = None
+            try:
+                created = await self.http.post(
+                    f"{self.settings.airdcpp_url}/api/v1/search", json={}, headers=self.headers
+                )
+                created.raise_for_status()
+                instance_id = created.json()["id"]
+                await self.http.post(
+                    f"{self.settings.airdcpp_url}/api/v1/search/{instance_id}/hub_search",
+                    json={"query": {"pattern": release.tth or release.name}, "hub_urls": []},
+                    headers=self.headers,
+                )
+                deadline = time.monotonic() + self.settings.search_timeout
+                selected = None
+                while time.monotonic() < deadline and selected is None:
+                    await asyncio.sleep(self.settings.search_poll_interval)
+                    response = await self.http.get(
+                        f"{self.settings.airdcpp_url}/api/v1/search/{instance_id}/results/0/{self.settings.search_max_results}",
+                        headers=self.headers,
+                    )
+                    response.raise_for_status()
+                    for item in response.json():
+                        if (release.tth and item.get("tth") == release.tth) or (
+                            int(float(item.get("size", 0))) == release.size
+                            and normalize_text(item.get("name", "")) == normalize_text(release.name)
+                        ):
+                            selected = item
+                            break
+                if not selected:
+                    raise AirDCError("No se encontró una fuente exacta para la descarga")
+                response = await self.http.post(
+                    f"{self.settings.airdcpp_url}/api/v1/search/{instance_id}/results/{selected['id']}/download",
+                    json={"priority": 3},
+                    headers=self.headers,
+                )
+                response.raise_for_status()
+                return str(response.json()["bundle_info"]["id"])
+            except (httpx.HTTPError, KeyError, ValueError) as exc:
+                raise AirDCError(f"No se pudo iniciar la descarga: {exc}") from exc
+            finally:
+                if instance_id is not None:
+                    try:
+                        await self.http.delete(
+                            f"{self.settings.airdcpp_url}/api/v1/search/{instance_id}", headers=self.headers
+                        )
+                    except httpx.HTTPError:
+                        pass
+
+    async def remove_bundle(self, bundle_id: str, delete_files: bool = False) -> None:
+        # La API de AirDC++ retira la entrada de la cola. El bridge nunca borra el path directamente.
+        response = await self.http.post(
+            f"{self.settings.airdcpp_url}/api/v1/queue/bundles/{bundle_id}/remove",
+            json={"remove_finished": bool(delete_files and self.settings.allow_file_delete)},
+            headers=self.headers,
+        )
+        if response.status_code not in {200, 204, 404}:
+            raise AirDCError(f"AirDC++ rechazó la retirada del bundle {bundle_id}: HTTP {response.status_code}")
