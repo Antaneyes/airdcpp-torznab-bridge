@@ -4,6 +4,7 @@ from app.utils.text import (
     normalize_text,
     search_variants,
     season_pattern,
+    strip_diacritics,
     title_roots,
 )
 
@@ -11,7 +12,14 @@ from app.utils.text import (
 def test_normalization_and_variants():
     assert normalize_text("La Casa de Papel") == "la casa de papel"
     assert clean_search_pattern("Show.Name (2024) [WEB] S01") == "Show Name"
-    assert search_variants(["Película Larga"], "2024") == ["Película Larga 2024", "Película Larga"]
+    assert strip_diacritics("Qué vida más triste") == "Que vida mas triste"
+    assert search_variants(["Qué vida más triste"]) == ["Qué vida más triste", "Que vida mas triste"]
+    assert search_variants(["Película Larga"], "2024") == [
+        "Película Larga 2024",
+        "Pelicula Larga 2024",
+        "Película Larga",
+        "Pelicula Larga",
+    ]
     assert title_roots(["Atlantis: El imperio perdido", "Atlantis: The Lost Empire"]) == ["Atlantis"]
     assert title_roots(["Atlantis The Lost Empire 2001"]) == ["Atlantis"]
     assert search_variants(["Atlantis: El imperio perdido", "Atlantis: The Lost Empire"], "2001")[:3] == [
