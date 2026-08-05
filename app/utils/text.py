@@ -4,9 +4,14 @@ import unicodedata
 SEASON_RE = re.compile(r"\b(?:S|T|Temporada|Season|Staffel|Temp|Part|Pt)\s*[._-]?\s*0?\d{1,2}\b", re.I)
 
 
-def normalize_text(value: str) -> str:
+def strip_diacritics(value: str) -> str:
+    """Elimina diacríticos sin alterar el resto de la consulta enviada al hub."""
     decomposed = unicodedata.normalize("NFKD", value or "")
-    asciiish = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return "".join(character for character in decomposed if not unicodedata.combining(character))
+
+
+def normalize_text(value: str) -> str:
+    asciiish = strip_diacritics(value)
     return " ".join(re.sub(r"[^\w]+", " ", asciiish.lower()).split())
 
 
@@ -46,10 +51,23 @@ def search_variants(titles: list[str], year: str | None = None) -> list[str]:
         else with_year
     )
     candidates.extend(roots + full_titles)
-    variants: list[str] = []
+    semantic_variants: list[str] = []
     for candidate in candidates:
-        if candidate and normalize_text(candidate) not in {normalize_text(value) for value in variants}:
-            variants.append(candidate)
+        if candidate and normalize_text(candidate) not in {normalize_text(value) for value in semantic_variants}:
+            semantic_variants.append(candidate)
+
+    # ADC compara los términos en cada cliente remoto y algunos clientes no
+    # consideran equivalentes las letras acentuadas. Conservamos la consulta
+    # original y añadimos una transliterada aunque ambas sean semánticamente
+    # iguales para nuestros filtros locales.
+    variants: list[str] = []
+    seen: set[str] = set()
+    for candidate in semantic_variants:
+        for variant in (candidate, strip_diacritics(candidate)):
+            key = " ".join(variant.casefold().split())
+            if key and key not in seen:
+                seen.add(key)
+                variants.append(variant)
     return variants
 
 
