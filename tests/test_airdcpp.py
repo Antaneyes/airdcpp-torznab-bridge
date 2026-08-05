@@ -87,6 +87,81 @@ async def test_upstream_failures_are_explicit():
     await http.aclose()
 
 
+async def test_season_search_prioritizes_directories():
+    hub_queries = []
+
+    def handler(request: httpx.Request):
+        path = request.url.path
+        if path == "/api/v1/search" and request.method == "POST":
+            return httpx.Response(200, json={"id": 42})
+        if path.endswith("/hub_search"):
+            hub_queries.append(request.read())
+            return httpx.Response(204)
+        if "/results/0/" in path:
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 7,
+                        "name": "Show Temporada 01",
+                        "path": "/Show/Temporada 01/",
+                        "size": 200,
+                        "type": {"id": "directory", "files": 2},
+                    }
+                ],
+            )
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        return httpx.Response(404)
+
+    client, http = make_client(handler)
+    results = await client.search(["Show"], season=1)
+
+    assert [result.name for result in results] == ["Show Temporada 01"]
+    assert len(hub_queries) == 1
+    assert b'"file_type":"directory"' in hub_queries[0]
+    await http.aclose()
+
+
+async def test_season_search_falls_back_to_all_result_types():
+    hub_queries = []
+
+    def handler(request: httpx.Request):
+        path = request.url.path
+        if path == "/api/v1/search" and request.method == "POST":
+            return httpx.Response(200, json={"id": 42})
+        if path.endswith("/hub_search"):
+            hub_queries.append(request.read())
+            return httpx.Response(204)
+        if "/results/0/" in path:
+            if len(hub_queries) == 1:
+                return httpx.Response(200, json=[])
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 8,
+                        "name": "Show S01",
+                        "path": "/Show/S01/",
+                        "size": 200,
+                        "type": {"id": "directory", "files": 2},
+                    }
+                ],
+            )
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        return httpx.Response(404)
+
+    client, http = make_client(handler)
+    results = await client.search(["Show"], season=1)
+
+    assert [result.name for result in results] == ["Show S01"]
+    assert len(hub_queries) == 2
+    assert b'"file_type":"directory"' in hub_queries[0]
+    assert b'"file_type"' not in hub_queries[1]
+    await http.aclose()
+
+
 def test_result_filters_seasons_extensions_and_invalid_items():
     client, _ = make_client(lambda request: httpx.Response(200))
     raw = [

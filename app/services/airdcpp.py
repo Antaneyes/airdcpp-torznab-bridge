@@ -69,36 +69,31 @@ class AirDCClient:
             response = await self.http.post(f"{self.settings.airdcpp_url}/api/v1/search", json={}, headers=self.headers)
             response.raise_for_status()
             instance_id = response.json()["id"]
+            assert instance_id is not None
             query_data: dict[str, object] = {"pattern": query}
             if season is not None:
                 # Los ficheros descendientes permiten demostrar que una carpeta
                 # generica contiene realmente la temporada solicitada.
                 query_data.update(size_min=50 * 1024 * 1024)
-            response = await self.http.post(
-                f"{self.settings.airdcpp_url}/api/v1/search/{instance_id}/hub_search",
-                json={"query": query_data, "hub_urls": []},
-                headers=self.headers,
-            )
-            response.raise_for_status()
-            deadline = time.monotonic() + self.settings.search_timeout
-            raw: list[dict] = []
-            previous = -1
-            stable = 0
-            while time.monotonic() < deadline:
-                await asyncio.sleep(self.settings.search_poll_interval)
-                response = await self.http.get(
-                    f"{self.settings.airdcpp_url}/api/v1/search/{instance_id}/results/0/{self.settings.search_max_results}",
-                    headers=self.headers,
-                )
-                response.raise_for_status()
-                raw = response.json()
-                if raw and len(raw) == previous:
-                    stable += 1
-                    if stable >= self.settings.search_stable_cycles:
-                        break
-                else:
-                    stable = 0
-                previous = len(raw)
+
+            if season is not None:
+                # En una busqueda amplia, los episodios individuales pueden
+                # agotar el limite de resultados del protocolo ADC y ocultar la
+                # carpeta que contiene la temporada. AirDC permite pedir solo
+                # directorios, que son los candidatos mas utiles para Sonarr.
+                directory_query = {**query_data, "file_type": "directory"}
+                raw = await self._collect_search_results(instance_id, directory_query)
+                raw = await self._inspect_ambiguous_season_folders(raw, query, season)
+                converted = self._convert_results(raw, query, season, extensions)
+                if converted:
+                    logger.info(
+                        "Temporada S%02d resuelta priorizando carpetas: resultados=%d",
+                        season,
+                        len(converted),
+                    )
+                    return converted
+
+            raw = await self._collect_search_results(instance_id, query_data)
             if season is not None:
                 raw = await self._inspect_ambiguous_season_folders(raw, query, season)
             return self._convert_results(raw, query, season, extensions)
@@ -112,6 +107,34 @@ class AirDCClient:
                     )
                 except httpx.HTTPError:
                     logger.warning("No se pudo eliminar la búsqueda AirDC++ %s", instance_id)
+
+    async def _collect_search_results(self, instance_id: str | int, query_data: dict[str, object]) -> list[dict]:
+        response = await self.http.post(
+            f"{self.settings.airdcpp_url}/api/v1/search/{instance_id}/hub_search",
+            json={"query": query_data, "hub_urls": []},
+            headers=self.headers,
+        )
+        response.raise_for_status()
+        deadline = time.monotonic() + self.settings.search_timeout
+        raw: list[dict] = []
+        previous = -1
+        stable = 0
+        while time.monotonic() < deadline:
+            await asyncio.sleep(self.settings.search_poll_interval)
+            response = await self.http.get(
+                f"{self.settings.airdcpp_url}/api/v1/search/{instance_id}/results/0/{self.settings.search_max_results}",
+                headers=self.headers,
+            )
+            response.raise_for_status()
+            raw = response.json()
+            if raw and len(raw) == previous:
+                stable += 1
+                if stable >= self.settings.search_stable_cycles:
+                    break
+            else:
+                stable = 0
+            previous = len(raw)
+        return raw
 
     def _convert_results(
         self, raw: list[dict], query: str, season: int | None, extensions: tuple[str, ...]
