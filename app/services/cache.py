@@ -1,30 +1,43 @@
+import asyncio
 import time
-from typing import Dict, Any, Optional
+from collections import OrderedDict
+from collections.abc import Callable, Coroutine
 
-# Almacén de búsquedas: { "query_key": {"timestamp": 12345, "results": [...]} }
-_SEARCH_CACHE: Dict[str, Any] = {}
-CACHE_TTL = 300 # 5 minutos de validez
 
-def get_cached_search(query_key: str) -> Optional[list]:
-    """Recupera resultados de caché si no han expirado."""
-    entry = _SEARCH_CACHE.get(query_key)
-    if entry:
-        if time.time() - entry["timestamp"] < CACHE_TTL:
-            return entry["results"]
-        else:
-            del _SEARCH_CACHE[query_key]
-    return None
+class AsyncTTLCache[T]:
+    def __init__(self, ttl: int, negative_ttl: int, max_size: int):
+        self.ttl = ttl
+        self.negative_ttl = negative_ttl
+        self.max_size = max_size
+        self._values: OrderedDict[str, tuple[float, T]] = OrderedDict()
+        self._inflight: dict[str, asyncio.Task[T]] = {}
+        self._lock = asyncio.Lock()
 
-def set_cached_search(query_key: str, results: list):
-    """Guarda resultados en caché con el timestamp actual."""
-    _SEARCH_CACHE[query_key] = {
-        "timestamp": time.time(),
-        "results": results
-    }
+    async def get_or_create(self, key: str, factory: Callable[[], Coroutine[object, object, T]]) -> T:
+        async with self._lock:
+            entry = self._values.get(key)
+            if entry and entry[0] > time.monotonic():
+                self._values.move_to_end(key)
+                return entry[1]
+            self._values.pop(key, None)
+            task = self._inflight.get(key)
+            if task is None:
+                task = asyncio.create_task(factory())
+                self._inflight[key] = task
+        try:
+            value = await asyncio.shield(task)
+            async with self._lock:
+                ttl = self.negative_ttl if not value else self.ttl
+                if ttl:
+                    self._values[key] = (time.monotonic() + ttl, value)
+                    while len(self._values) > self.max_size:
+                        self._values.popitem(last=False)
+            return value
+        finally:
+            async with self._lock:
+                if self._inflight.get(key) is task and task.done():
+                    self._inflight.pop(key, None)
 
-def clear_expired_cache():
-    """Limpia entradas viejas."""
-    now = time.time()
-    to_delete = [k for k, v in _SEARCH_CACHE.items() if now - v["timestamp"] > CACHE_TTL]
-    for k in to_delete:
-        del _SEARCH_CACHE[k]
+    async def clear(self) -> None:
+        async with self._lock:
+            self._values.clear()

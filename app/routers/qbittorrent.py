@@ -1,259 +1,290 @@
-import os
+import hashlib
 import time
-import requests
-import re
 import urllib.parse
-from fastapi import APIRouter, Response, Query, Request, Form, File, UploadFile, HTTPException
-from typing import Optional
-from app.config import KNOWN_CATEGORIES, AIRDCPP_URL, SAVE_PATH
-from app.core.locks import GLOBAL_SEARCH_LOCK
-from app.core.logging import get_logger
-from app.services.persistence import (
-    HASH_MAP_HEX_TO_TTH, HASH_MAP_TTH_TO_HEX, 
-    FINISHED_BUNDLES_CACHE, BUNDLE_MAP_ID_TO_TTH, 
-    BUNDLE_MAP_ID_TO_CAT, save_hashes, db_save_bundle,
-    get_hex_hash, db_get_bundle_ids_by_tth
-)
-from app.services.airdcpp import get_auth_headers
-from app.utils.text import clean_search_pattern, normalize_text
 
-router = APIRouter()
-logger = get_logger("app.routers.qbittorrent")
+from fastapi import APIRouter, Request, Response
 
-@router.get("/api/v2/app/version")
-@router.get("/version/api") 
-async def qbit_version():
-    return Response(content="v4.3.9", media_type="text/plain")
+from app.core.security import valid_login
+from app.models import DownloadRecord, DownloadState
+from app.services.airdcpp import AirDCError
 
-@router.get("/api/v2/app/webApiVersion")
-@router.get("/api/v2/app/webapiVersion")
-async def qbit_webapi_version():
-    return Response(content="2.8.2", media_type="text/plain")
+router = APIRouter(prefix="/api/v2")
 
-@router.post("/api/v2/auth/login")
-@router.post("/api/v2/auth/login/")
-async def qbit_login(response: Response):
-    response.set_cookie(key="SID", value="fake-session-id-12345", path="/")
-    return Response(content="Ok.", media_type="text/plain")
 
-@router.get("/api/v2/app/preferences")
-async def qbit_preferences():
-    return {"save_path": SAVE_PATH, "listen_port": 8000}
+def _categories(request: Request) -> tuple[str, ...]:
+    return request.app.state.settings.categories
 
-@router.get("/api/v2/torrents/categories")
-async def qbit_categories():
-    return {cat: {"name": cat, "savePath": SAVE_PATH} for cat in KNOWN_CATEGORIES}
 
-@router.get("/api/v2/torrents/properties")
-async def qbit_properties(hash: str):
+def _sid(request: Request) -> str:
+    settings = request.app.state.settings
+    raw = f"{settings.bridge_username}:{settings.bridge_password.get_secret_value()}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _authorized(request: Request) -> bool:
+    settings = request.app.state.settings
+    return settings.allow_insecure or settings.testing or request.cookies.get("SID") == _sid(request)
+
+
+def _auth_error() -> Response:
+    return Response("Forbidden", status_code=403, media_type="text/plain")
+
+
+@router.post("/auth/login")
+@router.post("/auth/login/")
+async def login(request: Request) -> Response:
+    form = await request.form()
+    settings = request.app.state.settings
+    valid = valid_login(str(form.get("username", "")), str(form.get("password", "")), settings)
+    response = Response("Ok." if valid else "Fails.", status_code=200, media_type="text/plain")
+    if valid:
+        response.set_cookie("SID", _sid(request), httponly=True, samesite="strict", path="/")
+    return response
+
+
+@router.post("/auth/logout")
+async def logout() -> Response:
+    response = Response("Ok.", media_type="text/plain")
+    response.delete_cookie("SID", path="/")
+    return response
+
+
+@router.get("/app/version")
+async def app_version(request: Request) -> Response:
+    return _auth_error() if not _authorized(request) else Response("v4.3.9", media_type="text/plain")
+
+
+@router.get("/app/webapiVersion")
+@router.get("/app/webApiVersion")
+async def api_version(request: Request) -> Response:
+    return _auth_error() if not _authorized(request) else Response("2.8.2", media_type="text/plain")
+
+
+@router.get("/app/preferences")
+async def preferences(request: Request):
+    if not _authorized(request):
+        return _auth_error()
+    return {"save_path": request.app.state.settings.save_path, "listen_port": 8000, "queueing_enabled": True}
+
+
+@router.get("/torrents/categories")
+async def categories(request: Request):
+    if not _authorized(request):
+        return _auth_error()
+    path = request.app.state.settings.save_path
+    return {name: {"name": name, "savePath": path} for name in _categories(request)}
+
+
+async def _refresh(request: Request, category: str | None = None) -> list[DownloadRecord]:
+    repository = request.app.state.repository
+    records = await repository.list_downloads(category)
+    bundles = await request.app.state.airdcpp.bundles()
+    by_id = {str(b.get("id")): b for b in bundles}
+    refreshed: list[DownloadRecord] = []
+    for record in records:
+        bundle = by_id.get(record.bundle_id or "")
+        if bundle:
+            size = int(float(bundle.get("size", record.size)))
+            downloaded = int(float(bundle.get("downloaded_bytes", 0)))
+            progress = downloaded / size if size else 0
+            completed = bool(bundle.get("status", {}).get("completed")) or progress >= 0.999
+            record.size = size
+            record.downloaded = downloaded
+            record.progress = min(1.0, progress)
+            record.speed = int(float(bundle.get("speed", 0)))
+            record.eta = int(float(bundle.get("seconds_left", 8640000)))
+            record.name = str(bundle.get("name", record.name))
+            if completed:
+                record.state = DownloadState.COMPLETED
+                record.progress = 1.0
+                record.downloaded = size
+                record.completed_on = int(bundle.get("time_finished") or record.completed_on or time.time())
+            elif progress > 0:
+                record.state = DownloadState.DOWNLOADING
+            await repository.save_download(record)
+        refreshed.append(record)
+    return refreshed
+
+
+def _qbit_item(record: DownloadRecord, save_path: str, ratio: float) -> dict:
+    completed = record.state == DownloadState.COMPLETED
+    state = "uploading" if completed else ("downloading" if record.progress > 0 else "stalledDL")
+    uploaded = int(record.size * ratio) if completed else 0
     return {
-        "save_path": SAVE_PATH,
-        "creation_date": int(time.time()),
-        "piece_size": 16384,
-        "is_seed": True,
-        "total_size": 0
+        "hash": record.download_id,
+        "name": record.name,
+        "size": record.size,
+        "progress": record.progress,
+        "dlspeed": record.speed,
+        "upspeed": 0,
+        "eta": 0 if completed else record.eta,
+        "state": state,
+        "amount_left": max(0, record.size - record.downloaded),
+        "completed": record.completed_on,
+        "save_path": save_path,
+        "content_path": f"{save_path.rstrip('/')}/{record.name}",
+        "category": record.category,
+        "tags": "",
+        "num_seeds": 0,
+        "num_leechs": 0,
+        "added_on": record.added_on,
+        "completion_on": record.completed_on,
+        "downloaded": record.downloaded,
+        "uploaded": uploaded,
+        "ratio": ratio if completed else 0.0,
+        "seeding_time": 0,
     }
 
-@router.get("/api/v2/torrents/files")
-def qbit_files(hash: str):
-    headers = get_auth_headers()
-    tth = HASH_MAP_HEX_TO_TTH.get(hash, hash)
-    r = requests.get(f"{AIRDCPP_URL}/api/v1/queue/bundles/0/1000", headers=headers, timeout=5)
-    size, name = 0, "unknown_file"
-    if r.status_code == 200:
-        for b in r.json():
-            if BUNDLE_MAP_ID_TO_TTH.get(str(b["id"])) == tth:
-                size, name = int(float(b["size"])), b["name"]
-                break
-    return [{"name": name, "size": size, "progress": 1.0, "priority": 1, "is_seed": True,
-        "piece_range_start": 0, "piece_range_end": 1, "availability": 1.0}]
 
-@router.post("/api/v2/torrents/delete")
-async def qbit_delete(hashes: Optional[str] = Form(None), deleteFiles: Optional[bool] = Form(False)):
-    target_hashes = hashes.split('|') if hashes else []
-    headers = get_auth_headers()
-    for h in target_hashes:
-        tth = HASH_MAP_HEX_TO_TTH.get(h)
-        if tth:
-            bundle_ids = db_get_bundle_ids_by_tth(tth)
-            if bundle_ids:
-                logger.info(f"Cancelando descargas en AirDC++ para TTH {tth}: {bundle_ids}")
-                for b_id in bundle_ids:
-                    try: requests.post(f"{AIRDCPP_URL}/api/v1/queue/bundles/{b_id}/remove", headers=headers, timeout=2)
-                    except: pass
-            if tth in FINISHED_BUNDLES_CACHE:
-                del FINISHED_BUNDLES_CACHE[tth]
-    return Response(content="Ok.", media_type="text/plain")
-
-def _get_qbit_info_internal(category: Optional[str] = None):
-    headers = get_auth_headers()
+@router.get("/torrents/info")
+async def torrent_info(request: Request, category: str | None = None):
+    if not _authorized(request):
+        return _auth_error()
     try:
-        r = requests.get(f"{AIRDCPP_URL}/api/v1/queue/bundles/0/1000", headers=headers, timeout=5)
-        bundles = r.json() if r.status_code == 200 else []
-        qbit_results, reported_tths = [], set()
-        req_cat = category.lower() if category else None
-        needs_save = False
-        
-        for b in bundles:
-            bundle_id = str(b["id"])
-            tth = BUNDLE_MAP_ID_TO_TTH.get(bundle_id)
-            if not tth: continue
-            
-            bundle_cat = BUNDLE_MAP_ID_TO_CAT.get(bundle_id, "radarr").lower()
-            if req_cat and bundle_cat != req_cat: continue
-            
-            reported_tths.add(tth)
-            fake_hash = get_hex_hash(tth)
-            downloaded = int(float(b.get("downloaded_bytes", 0)))
-            size = int(float(b["size"]))
-            progress = downloaded / size if size > 0 else 0
-            is_completed = b.get("status", {}).get("completed", False) or progress >= 0.999
-            
-            if is_completed:
-                state = "uploading"
-            elif progress == 0:
-                state = "stalledDL"
-            else:
-                state = "downloading"
+        records = await _refresh(request, category)
+    except AirDCError as exc:
+        return Response(str(exc), status_code=502, media_type="text/plain")
+    settings = request.app.state.settings
+    return [_qbit_item(record, settings.save_path, settings.completed_ratio) for record in records]
 
-            # === CALCULAR CAMPOS DE RATIO Y SUBIDA ===
-            if is_completed:
-                # Cuando está completado, simulamos ratio 1.5 (150% subido)
-                uploaded = int(size * 1.5)
-                ratio = 1.5
-                upspeed = 0  # No hay subida activa, ya completó
-            elif progress == 0:
-                # Aún no ha empezado a descargar
-                uploaded = 0
-                ratio = 0.0
-                upspeed = 0
-            else:
-                # Durante la descarga, simular subida proporcional (50% de lo descargado)
-                uploaded = int(size * progress * 0.5)
-                ratio = 0.5 if downloaded > 0 else 0.0
-                upspeed = int(float(b.get("speed", 0)) * 0.3)  # 30% de velocidad de descarga
 
-            # INFO COMPLETA PARA SONARR/RADARR
-            res_item = {
-                "hash": fake_hash,
-                "name": b["name"],
-                "size": size,
-                "progress": progress,
-                "dlspeed": int(float(b.get("speed", 0))),
-                "eta": int(float(b.get("seconds_left", 864000))),
-                "state": state,
-                "amount_left": max(0, size - downloaded),
-                "completed": int(b.get("time_finished", 0)),
-                "save_path": SAVE_PATH,
-                "content_path": os.path.join(SAVE_PATH, b["name"]),
-                "label": bundle_cat,
-                "category": bundle_cat,
-                "num_seeds": 1 if is_completed else 0,
-                "num_leechs": 0,
-                "added_on": int(b.get("time_added", time.time())),
-                "completion_on": int(b.get("time_finished", 0)),
-                # === CAMPOS DE RATIO Y SUBIDA ===
-                "uploaded": uploaded,
-                "downloaded": downloaded,
-                "ratio": ratio,
-                "upspeed": upspeed
-            }
-            if is_completed:
-                if tth not in FINISHED_BUNDLES_CACHE:
-                    logger.info(f"Bundle {b['name']} marcado como completado en cache. Ratio simulado: 1.5")
-                    needs_save = True
-                FINISHED_BUNDLES_CACHE[tth] = res_item
-            qbit_results.append(res_item)
-            
-        if needs_save: save_hashes()
-        for t_tth, cached in FINISHED_BUNDLES_CACHE.items():
-            if t_tth not in reported_tths and (not req_cat or cached.get("category") == req_cat):
-                qbit_results.append(cached)
-        return qbit_results
-    except Exception as e: 
-        logger.error(f"Error en qbit_info: {e}")
+@router.get("/sync/maindata")
+async def main_data(request: Request, category: str | None = None):
+    result = await torrent_info(request, category)
+    if isinstance(result, Response):
+        return result
+    path = request.app.state.settings.save_path
+    return {
+        "full_update": True,
+        "torrents": {item["hash"]: item for item in result},
+        "categories": {name: {"name": name, "savePath": path} for name in _categories(request)},
+        "server_state": {"free_space_on_disk": -1},
+    }
+
+
+@router.get("/torrents/properties")
+async def torrent_properties(request: Request, hash: str):
+    if not _authorized(request):
+        return _auth_error()
+    record = await request.app.state.repository.get_download(hash)
+    if not record:
+        return Response("Not found", status_code=404)
+    return {
+        "save_path": request.app.state.settings.save_path,
+        "creation_date": record.added_on,
+        "completion_date": record.completed_on,
+        "total_size": record.size,
+        "piece_size": 0,
+        "is_seed": record.state == DownloadState.COMPLETED,
+    }
+
+
+@router.get("/torrents/files")
+async def torrent_files(request: Request, hash: str):
+    if not _authorized(request):
+        return _auth_error()
+    record = await request.app.state.repository.get_download(hash)
+    if not record:
         return []
+    return [
+        {
+            "index": 0,
+            "name": record.name,
+            "size": record.size,
+            "progress": record.progress,
+            "priority": 1,
+            "is_seed": record.state == DownloadState.COMPLETED,
+            "piece_range": [0, 0],
+            "availability": 1.0 if record.state == DownloadState.COMPLETED else 0.0,
+        }
+    ]
 
-@router.get("/api/v2/torrents/info")
-def qbit_info(category: Optional[str] = None):
-    return _get_qbit_info_internal(category)
 
-@router.get("/api/v2/sync/maindata")
-def qbit_maindata(category: Optional[str] = None):
-    torrents = {t["hash"]: t for t in _get_qbit_info_internal(category=category)}
-    return {"torrents": torrents, "full_update": True, "categories": {cat: {"name": cat, "savePath": SAVE_PATH} for cat in KNOWN_CATEGORIES}}
+@router.post("/torrents/add")
+async def torrent_add(request: Request) -> Response:
+    if not _authorized(request):
+        return _auth_error()
+    form = await request.form()
+    urls = str(form.get("urls", ""))
+    category = str(form.get("category") or "sonarr").lower()
+    if category not in _categories(request):
+        return Response("Categoría no soportada", status_code=400)
+    if not urls:
+        return Response("Solo se admiten magnet URLs", status_code=400)
+    success = False
+    for url in urls.splitlines():
+        parsed = urllib.parse.urlparse(url.strip())
+        params = urllib.parse.parse_qs(parsed.query)
+        xt = params.get("xt", [""])[0]
+        release_id = xt.rsplit(":", 1)[-1]
+        release = await request.app.state.repository.get_release(release_id)
+        if not release:
+            continue
+        try:
+            bundle_id = await request.app.state.airdcpp.download(release)
+            await request.app.state.repository.save_download(
+                DownloadRecord(
+                    download_id=release_id,
+                    release_id=release_id,
+                    bundle_id=bundle_id,
+                    category=category,
+                    name=release.name,
+                    size=release.size,
+                    added_on=int(time.time()),
+                )
+            )
+            success = True
+        except AirDCError:
+            continue
+    return Response("Ok." if success else "Fallo.", status_code=200 if success else 502, media_type="text/plain")
 
-@router.post("/api/v2/torrents/add")
-def qbit_add(request: Request, urls: Optional[str] = Form(None), category: Optional[str] = Form(None)):
-    headers = get_auth_headers()
-    # Usar categoría enviada por el cliente, o auto-detectar
-    final_category = category if category else "sonarr"
-    
-    with GLOBAL_SEARCH_LOCK:
-        logger.info(f"--- SOLICITUD DE DESCARGA ---")
-        url_list = urls.split("\n") if urls else []
-        any_success = False
-        for url in url_list:
-            url = url.strip()
-            if not url: continue
-            raw_hash = url.split("tiger:")[1].split("&")[0] if "tiger:" in url else (url.split("btih:")[1].split("&")[0] if "btih:" in url else None)
-            if not raw_hash: continue
-            
-            tth = HASH_MAP_HEX_TO_TTH.get(raw_hash, raw_hash)
-            if tth == "da39a3ee5e6b4b0d3255bfef95601890afd80709": continue
-            
+
+@router.post("/torrents/delete")
+async def torrent_delete(request: Request) -> Response:
+    if not _authorized(request):
+        return _auth_error()
+    form = await request.form()
+    hashes = str(form.get("hashes", ""))
+    delete_files = str(form.get("deleteFiles", "false")).lower() == "true"
+    for download_id in hashes.split("|"):
+        record = await request.app.state.repository.get_download(download_id)
+        if not record:
+            continue
+        if record.bundle_id:
             try:
-                expected_name = urllib.parse.unquote(url.split("dn=")[1].split("&")[0]) if "dn=" in url else "Unknown"
-                logger.info(f"Buscando el archivo exacto: '{expected_name}'")
-                
-                res = requests.post(f"{AIRDCPP_URL}/api/v1/search", json=dict(), headers=headers, timeout=10)
-                instance_id = res.json()["id"]
-                
-                search_payload = {"query": {"pattern": expected_name}, "priority": 2}
-                requests.post(f"{AIRDCPP_URL}/api/v1/search/{instance_id}/hub_search", json=search_payload, headers=headers, timeout=10)
-                
-                selected_result = None
-                for i in range(8):
-                    time.sleep(2)
-                    r_res = requests.get(f"{AIRDCPP_URL}/api/v1/search/{instance_id}/results/0/500", headers=headers, timeout=5)
-                    if r_res.status_code == 200:
-                        results = [r for r in r_res.json() if r.get("tth") == tth]
-                        if results:
-                            for r in results:
-                                if r["name"] == expected_name:
-                                    selected_result = r
-                                    break
-                            if not selected_result: selected_result = results[0]
-                            break
-                
-                if not selected_result:
-                    logger.info("  - Fallback por TTH...")
-                    search_payload_tth = {"query": {"pattern": tth, "file_type": "tth"}, "priority": 2}
-                    requests.post(f"{AIRDCPP_URL}/api/v1/search/{instance_id}/hub_search", json=search_payload_tth, headers=headers, timeout=10)
-                    for i in range(5):
-                        time.sleep(2)
-                        r_res = requests.get(f"{AIRDCPP_URL}/api/v1/search/{instance_id}/results/0/100", headers=headers, timeout=5)
-                        if r_res.status_code == 200:
-                            results = r_res.json()
-                            if results:
-                                selected_result = results[0]
-                                break
+                await request.app.state.airdcpp.remove_bundle(record.bundle_id, delete_files)
+            except AirDCError as exc:
+                return Response(str(exc), status_code=502)
+        await request.app.state.repository.mark_removed(download_id)
+    return Response("Ok.", media_type="text/plain")
 
-                if selected_result:
-                    logger.info(f"Archivo hallado: {selected_result['name']}")
-                    dl = requests.post(f"{AIRDCPP_URL}/api/v1/search/{instance_id}/results/{selected_result['id']}/download", json={"priority": 3}, headers=headers, timeout=10)
-                    if dl.status_code < 300:
-                        try:
-                            bundle_id = str(dl.json()["bundle_info"]["id"])
-                            db_save_bundle(bundle_id, tth, final_category)
-                            any_success = True
-                        except: 
-                            logger.error("Error al procesar respuesta de AirDC++")
-                    elif dl.status_code == 400 and "already" in dl.text.lower():
-                        any_success = True
-                
-                requests.delete(f"{AIRDCPP_URL}/api/v1/search/{instance_id}", headers=headers, timeout=5)
-            except Exception as e: logger.error(f"Fallo en descarga: {e}")
-        
-        if any_success: return Response(content="Ok.", status_code=200, media_type="text/plain")
-        else: return Response(content="Fallo.", status_code=500, media_type="text/plain")
+
+@router.post("/torrents/setCategory")
+async def set_category(request: Request) -> Response:
+    if not _authorized(request):
+        return _auth_error()
+    form = await request.form()
+    category = str(form.get("category", "")).strip().lower()
+    if category not in _categories(request):
+        return Response("Categoría no soportada", status_code=400)
+    for download_id in str(form.get("hashes", "")).split("|"):
+        await request.app.state.repository.update_category(download_id, category)
+    return Response("Ok.", media_type="text/plain")
+
+
+@router.post("/torrents/setShareLimits")
+@router.post("/torrents/topPrio")
+@router.post("/torrents/setForceStart")
+async def accepted_noop(request: Request) -> Response:
+    return _auth_error() if not _authorized(request) else Response("Ok.", media_type="text/plain")
+
+
+@router.post("/torrents/createCategory")
+async def create_category(request: Request) -> Response:
+    if not _authorized(request):
+        return _auth_error()
+    form = await request.form()
+    category = str(form.get("category", "")).strip().lower()
+    if category not in _categories(request):
+        return Response("Categoría no soportada", status_code=400)
+    return Response("Ok.", media_type="text/plain")
