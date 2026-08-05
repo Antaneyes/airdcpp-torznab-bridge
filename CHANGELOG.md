@@ -2,6 +2,18 @@
 
 All notable changes are documented here. This project follows semantic versioning while allowing breaking changes between beta releases.
 
+## [2.0.0-beta.3] - 2026-08-05
+
+### Added
+
+- Searches retry title variants without diacritics for hubs that distinguish accented text.
+- Season searches prioritize directory results before falling back to mixed result types.
+- A documented design for optional synthetic RSS support is preserved for future work.
+
+### Fixed
+
+- Valid season folders are less likely to be hidden by a hub's per-user limit on individual file results.
+
 ## [2.0.0-beta.2] - 2026-08-05
 
 ### Added
