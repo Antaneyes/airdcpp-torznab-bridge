@@ -38,6 +38,7 @@ def feed_xml(
     imdb_id: str | None = None,
     tmdb_id: str | None = None,
     tvdb_id: str | None = None,
+    browse_enabled: bool = False,
 ) -> str:
     rss = ET.Element("rss", {"version": "2.0"})
     channel = ET.SubElement(rss, "channel")
@@ -57,7 +58,8 @@ def feed_xml(
         if api_key:
             download += "&apikey=" + urllib.parse.quote(api_key, safe="")
         ET.SubElement(item, "link").text = magnet
-        ET.SubElement(item, "comments").text = base_url
+        comments = f"{base_url}/browse/{result.release_id}" if browse_enabled else base_url
+        ET.SubElement(item, "comments").text = comments
         published_at = result.published_at or int(time.time())
         ET.SubElement(item, "pubDate").text = email.utils.formatdate(published_at, usegmt=True)
         ET.SubElement(item, "size").text = str(result.size)

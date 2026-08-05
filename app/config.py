@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     save_path: str = "/downloads"
     download_categories: str = "radarr,sonarr,radarr4k,sonarr4k"
     public_url: str = ""
+    airdcpp_web_url: str = ""
     completed_ratio: float = Field(default=1.5, ge=0)
     allow_file_delete: bool = False
 
@@ -43,6 +44,11 @@ class Settings(BaseSettings):
     @field_validator("airdcpp_url")
     @classmethod
     def normalize_url(cls, value: str) -> str:
+        return value.rstrip("/")
+
+    @field_validator("public_url", "airdcpp_web_url")
+    @classmethod
+    def normalize_public_urls(cls, value: str) -> str:
         return value.rstrip("/")
 
     @field_validator("save_path")

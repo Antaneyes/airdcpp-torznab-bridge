@@ -228,3 +228,31 @@ async def test_partial_filelist_recognizes_and_downloads_nested_season():
     assert await client.download(results[0]) == "88"
     assert ("DELETE", "/api/v1/filelists/CID") in calls
     await http.aclose()
+
+
+async def test_open_filelist_location_moves_existing_session():
+    requests = []
+
+    def handler(request: httpx.Request):
+        requests.append((request.method, request.url.path, request.content))
+        if request.url.path == "/api/v1/filelists" and request.method == "GET":
+            return httpx.Response(200, json=[{"id": "CID"}])
+        if request.url.path == "/api/v1/filelists/CID/directory":
+            return httpx.Response(204)
+        return httpx.Response(404)
+
+    client, http = make_client(handler)
+    client.settings.airdcpp_web_url = "https://airdc.example"
+    release = SearchResult(
+        release_id="b" * 40,
+        name="Show S01",
+        size=100,
+        item_type="directory",
+        source_cid="CID",
+        source_hub_url="adc://hub",
+        source_path="/Series/Show/S01/",
+    )
+
+    assert await client.open_filelist_location(release) == "https://airdc.example/filelists/session/CID"
+    assert ("POST", "/api/v1/filelists/CID/directory", b'{"list_path":"/Series/Show/S01/"}') in requests
+    await http.aclose()

@@ -1,10 +1,24 @@
 import urllib.parse
 
 from fastapi import APIRouter, Request, Response
+from fastapi.responses import RedirectResponse
 
+from app.services.airdcpp import AirDCError
 from app.utils.xml import COMPAT_TRACKER, error_xml
 
 router = APIRouter()
+
+
+@router.get("/browse/{release_id}")
+async def browse_release(release_id: str, request: Request) -> Response:
+    release = await request.app.state.repository.get_release(release_id)
+    if not release:
+        return Response("El resultado ha caducado o no existe", status_code=404)
+    try:
+        location = await request.app.state.airdcpp.open_filelist_location(release)
+    except AirDCError as exc:
+        return Response(str(exc), status_code=502)
+    return RedirectResponse(location, status_code=302)
 
 
 @router.get("/health")

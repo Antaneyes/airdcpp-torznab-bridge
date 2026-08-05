@@ -4,6 +4,7 @@ import hashlib
 import logging
 import re
 import time
+import urllib.parse
 
 import httpx
 
@@ -514,3 +515,42 @@ class AirDCClient:
         )
         if response.status_code not in {200, 204, 404}:
             raise AirDCError(f"AirDC++ rechazó la retirada del bundle {bundle_id}: HTTP {response.status_code}")
+
+    async def open_filelist_location(self, release: SearchResult) -> str:
+        """Abre o mueve la lista remota y devuelve su ruta en el Web UI."""
+        if not self.settings.airdcpp_web_url:
+            raise AirDCError("AIRDCPP_WEB_URL no está configurada")
+        source_cid = release.source_cid
+        source_hub_url = release.source_hub_url
+        source_path = release.source_path
+        if not source_cid or not source_hub_url or not source_path:
+            raise AirDCError("El resultado no contiene una ubicación navegable en AirDC++")
+
+        path = source_path
+        if release.item_type == "file":
+            path = path.rsplit("/", 1)[0] + "/"
+        try:
+            response = await self.http.get(f"{self.settings.airdcpp_url}/api/v1/filelists", headers=self.headers)
+            response.raise_for_status()
+            is_open = any(str(item.get("id")) == source_cid for item in response.json())
+            if is_open:
+                response = await self.http.post(
+                    f"{self.settings.airdcpp_url}/api/v1/filelists/{source_cid}/directory",
+                    json={"list_path": path},
+                    headers=self.headers,
+                )
+            else:
+                response = await self.http.post(
+                    f"{self.settings.airdcpp_url}/api/v1/filelists",
+                    json={
+                        "user": {"cid": source_cid, "hub_url": source_hub_url},
+                        "directory": path,
+                    },
+                    headers=self.headers,
+                )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise AirDCError(f"No se pudo abrir la carpeta en AirDC++: {exc}") from exc
+
+        cid = urllib.parse.quote(source_cid, safe="")
+        return f"{self.settings.airdcpp_web_url}/filelists/session/{cid}"

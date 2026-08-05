@@ -61,6 +61,8 @@ contenedores.
 | --- | --- | --- |
 | `AIRDCPP_URL` | URL de AirDC++ | `http://localhost:5600` |
 | `AIRDCPP_USER` / `AIRDCPP_PASS` | Credenciales de AirDC++ | obligatorias |
+| `AIRDCPP_WEB_URL` | URL pública del Web UI; activa enlaces a las carpetas desde Arr | vacío |
+| `PUBLIC_URL` | URL pública del bridge usada en enlaces y descargas | vacío |
 | `BRIDGE_API_KEY` | Clave del indexador Torznab | obligatoria |
 | `BRIDGE_USERNAME` / `BRIDGE_PASSWORD` | Login qBittorrent de Arr | obligatorias |
 | `DOWNLOAD_CATEGORIES` | Categorías qBittorrent separadas por comas | `radarr,sonarr,radarr4k,sonarr4k` |

@@ -39,12 +39,12 @@ async def torznab(
             size=1,
             item_type="validation",
         )
-        base_url = str(request.base_url).rstrip("/")
+        base_url = settings.public_url or str(request.base_url).rstrip("/")
         xml = feed_xml([validation], base_url, apikey, cat or ("5000" if season is not None else "2000"), season, ep)
         return Response(xml, media_type="application/xml")
     try:
         results = await request.app.state.search_service.search(q, cat, imdbid, tmdbid, tvdbid, season, ep)
-        base_url = str(request.base_url).rstrip("/")
+        base_url = settings.public_url or str(request.base_url).rstrip("/")
         xml = feed_xml(
             results,
             base_url,
@@ -55,6 +55,7 @@ async def torznab(
             imdbid,
             tmdbid,
             tvdbid,
+            bool(settings.airdcpp_web_url),
         )
         return Response(xml, media_type="application/xml")
     except AirDCError as exc:

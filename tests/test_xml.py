@@ -42,3 +42,12 @@ def test_feed_contains_stable_release_contract():
     assert "tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce" in attrs["magneturl"]
     assert attrs["imdb"] == "0230011"
     assert attrs["tmdbid"] == "10865"
+
+
+def test_feed_can_link_release_title_to_browse_endpoint():
+    result = SearchResult(release_id="b" * 40, name="Show S01", size=123)
+    xml = feed_xml([result], "https://bridge.example", "", "5000", 1, None, browse_enabled=True)
+    item = ET.fromstring(xml).find("./channel/item")
+
+    assert item is not None
+    assert item.findtext("comments") == f"https://bridge.example/browse/{'b' * 40}"
