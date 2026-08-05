@@ -1,0 +1,43 @@
+name: Bug report
+description: Report a reproducible bridge problem
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include credentials, private hub addresses, API keys or complete file-list links.
+  - type: input
+    id: version
+    attributes:
+      label: Bridge version/image tag
+      placeholder: 2.0.0-beta.2
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options: [Radarr search, Sonarr search, Download client, Import/paths, Docker/install, Upgrade from v1, Other]
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Include the query, expected result and actual result.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I removed credentials, API keys and private addresses.
+          required: true
+        - label: I tested `/health/ready` and read the troubleshooting section.
+          required: true

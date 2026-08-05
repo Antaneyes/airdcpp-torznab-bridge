@@ -1,4 +1,6 @@
-fastapi
-uvicorn
-requests
-python-multipart
+fastapi==0.141.1
+uvicorn==0.52.1
+httpx==0.28.1
+python-multipart==0.0.32
+pydantic-settings==2.14.2
+aiosqlite==0.22.1
