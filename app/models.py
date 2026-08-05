@@ -29,6 +29,7 @@ class SearchResult(BaseModel):
     source_cid: str | None = None
     source_hub_url: str | None = None
     download_via_filelist: bool = False
+    selected_files: list[dict[str, str | int]] = Field(default_factory=list)
 
 
 class DownloadRecord(BaseModel):

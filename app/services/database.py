@@ -7,7 +7,7 @@ import aiosqlite
 
 from app.models import DownloadRecord, DownloadState, SearchResult
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class Repository:
@@ -56,6 +56,7 @@ class Repository:
                     source_cid TEXT,
                     source_hub_url TEXT,
                     download_via_filelist INTEGER NOT NULL DEFAULT 0,
+                    selected_files TEXT NOT NULL DEFAULT '[]',
                     created_at INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS downloads (
@@ -90,6 +91,8 @@ class Repository:
                     await db.execute(f"ALTER TABLE releases ADD COLUMN {column} TEXT")
             if "download_via_filelist" not in columns:
                 await db.execute("ALTER TABLE releases ADD COLUMN download_via_filelist INTEGER NOT NULL DEFAULT 0")
+            if "selected_files" not in columns:
+                await db.execute("ALTER TABLE releases ADD COLUMN selected_files TEXT NOT NULL DEFAULT '[]'")
             await self._migrate_legacy(db)
             await db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             await db.commit()
@@ -108,9 +111,9 @@ class Repository:
             await db.execute(
                 """INSERT OR IGNORE INTO releases
                 (release_id,name,size,tth,item_type,source_id,query,published_at,availability,languages,
-                 source_name,source_path,source_cid,source_hub_url,download_via_filelist,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (release_id, name, size, tth, "file", None, "legacy", 0, 1, "[]", None, None, None, None, 0,
+                 source_name,source_path,source_cid,source_hub_url,download_via_filelist,selected_files,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (release_id, name, size, tth, "file", None, "legacy", 0, 1, "[]", None, None, None, None, 0, "[]",
                  int(time.time())),
             )
             state = DownloadState.COMPLETED if finished_row else DownloadState.QUEUED
@@ -155,8 +158,8 @@ class Repository:
             await db.execute(
                 """INSERT OR REPLACE INTO releases
                 (release_id,name,size,tth,item_type,source_id,query,published_at,availability,languages,
-                 source_name,source_path,source_cid,source_hub_url,download_via_filelist,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 source_name,source_path,source_cid,source_hub_url,download_via_filelist,selected_files,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     result.release_id,
                     result.name,
@@ -173,6 +176,7 @@ class Repository:
                     result.source_cid,
                     result.source_hub_url,
                     int(result.download_via_filelist),
+                    json.dumps(result.selected_files),
                     int(time.time()),
                 ),
             )
@@ -204,6 +208,7 @@ class Repository:
             }
             data["availability"] = row["availability"]
             data["languages"] = json.loads(row["languages"])
+            data["selected_files"] = json.loads(row["selected_files"])
             return SearchResult(**data)
 
     async def save_download(self, record: DownloadRecord) -> None:

@@ -168,6 +168,7 @@ class AirDCClient:
                     source_cid=source_cid,
                     source_hub_url=source_hub_url,
                     download_via_filelist=bool(item.get("_download_via_filelist")),
+                    selected_files=list(item.get("_selected_files") or []),
                 )
             )
         if season is not None:
@@ -351,7 +352,7 @@ class AirDCClient:
                     return None
                 items = await self._filelist_items(cid)
 
-            videos = [
+            all_videos = [
                 value
                 for value in items
                 if str(value.get("type", {}).get("id", "")) == "file"
@@ -359,12 +360,27 @@ class AirDCClient:
                     (".mkv", ".avi", ".mp4", ".m4v", ".mov", ".wmv", ".mpg", ".mpeg")
                 )
             ]
+            videos = all_videos
+            mixed_root = False
+            if not target:
+                marked = [(value, episode_marker(str(value.get("name") or ""))) for value in all_videos]
+                videos = [value for value, marker in marked if marker and marker[0] == season]
+                mixed_root = any(marker and marker[0] != season for _, marker in marked)
             markers = [episode_marker(str(value.get("name") or "")) for value in videos]
             if len(markers) < 2 or any(marker is None or marker[0] != season for marker in markers):
                 return None
             episodes = sorted({marker[1] for marker in markers if marker})
-            if episodes != list(range(1, episodes[-1] + 1)):
+            if len(episodes) != len(markers) or episodes != list(range(1, episodes[-1] + 1)):
                 return None
+            selected_files: list[dict[str, str | int]] = []
+            if mixed_root:
+                for value in videos:
+                    tth = str(value.get("tth") or "")
+                    size = int(float(value.get("size", 0) or 0))
+                    name = str(value.get("name") or "")
+                    if not tth or not name or size <= 0:
+                        return None
+                    selected_files.append({"name": name, "size": size, "tth": tth})
             selected = target or folder
             suffix = self._common_technical_suffix([str(value.get("name") or "") for value in videos])
             display = f"{folder.get('name') or query} S{season:02d}" + (f" {suffix}" if suffix else "")
@@ -377,7 +393,10 @@ class AirDCClient:
                 "hits": folder.get("hits", 1),
                 "time": selected.get("time", folder.get("time", 0)),
                 "_verified_display": display,
-                "_download_via_filelist": True,
+                "size": sum(int(float(value.get("size", 0) or 0)) for value in videos),
+                "type": {"id": "bundle", "files": len(videos)},
+                "_download_via_filelist": not mixed_root,
+                "_selected_files": selected_files,
             }
         except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
             logger.info("No se pudo inspeccionar la carpeta %r: %s", folder.get("name"), exc)
@@ -413,9 +432,38 @@ class AirDCClient:
         return list(response.json().get("items", []))
 
     async def download(self, release: SearchResult) -> str:
+        if release.selected_files:
+            return await self._download_selected_files(release)
         if release.download_via_filelist:
             return await self._download_filelist_directory(release)
         return await self._search_and_download(release)
+
+    async def _download_selected_files(self, release: SearchResult) -> str:
+        """Crea un unico bundle con los episodios elegidos de una carpeta multitemporada."""
+        if not release.source_cid or not release.source_hub_url:
+            raise AirDCError("Faltan datos de origen para descargar la temporada seleccionada")
+        try:
+            response = await self.http.post(
+                f"{self.settings.airdcpp_url}/api/v1/queue/bundles/directory",
+                json={
+                    "user": {"cid": release.source_cid, "hub_url": release.source_hub_url},
+                    "target_name": release.name,
+                    "priority": 3,
+                    "files": [
+                        {**value, "priority": 3}
+                        for value in release.selected_files
+                    ],
+                },
+                headers=self.headers,
+            )
+            response.raise_for_status()
+            data = response.json()
+            bundle = data.get("bundle") or {}
+            if bundle.get("id") is None:
+                raise AirDCError(str(data.get("error") or "AirDC++ no devolvio el bundle creado"))
+            return str(bundle["id"])
+        except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+            raise AirDCError(f"No se pudo iniciar la descarga selectiva: {exc}") from exc
 
     async def _download_filelist_directory(self, release: SearchResult) -> str:
         if not all((release.source_path, release.source_cid, release.source_hub_url)):

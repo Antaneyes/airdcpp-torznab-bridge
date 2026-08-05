@@ -230,6 +230,114 @@ async def test_partial_filelist_recognizes_and_downloads_nested_season():
     await http.aclose()
 
 
+async def test_partial_filelist_selects_only_requested_season_from_mixed_root():
+    calls = []
+
+    def video(season: int, episode: int) -> dict:
+        return {
+            "id": f"{season}-{episode}",
+            "name": f"Show.S{season:02d}E{episode:02d}.1080p.DUAL.mkv",
+            "path": f"/Show/Show.S{season:02d}E{episode:02d}.1080p.DUAL.mkv",
+            "size": 100 + episode,
+            "tth": f"TTH-{season}-{episode}",
+            "type": {"id": "file"},
+        }
+
+    items = [*(video(1, episode) for episode in range(1, 7)), *(video(2, episode) for episode in range(1, 4))]
+
+    def handler(request: httpx.Request):
+        calls.append((request.method, request.url.path, request.content))
+        path = request.url.path
+        if path == "/api/v1/filelists" and request.method == "GET":
+            return httpx.Response(200, json=[])
+        if path == "/api/v1/filelists" and request.method == "POST":
+            return httpx.Response(200, json={"id": "CID"})
+        if path == "/api/v1/filelists/CID" and request.method == "GET":
+            return httpx.Response(
+                200,
+                json={"state": {"id": "loaded"}, "location": {"path": "/Show/", "name": "Show"}},
+            )
+        if path == "/api/v1/filelists/CID/items/0/1000":
+            return httpx.Response(200, json={"items": items})
+        if path == "/api/v1/filelists/CID" and request.method == "DELETE":
+            return httpx.Response(204)
+        if path == "/api/v1/queue/bundles/directory" and request.method == "POST":
+            return httpx.Response(200, json={"files_queued": 3, "bundle": {"id": 99}})
+        return httpx.Response(404)
+
+    client, http = make_client(handler)
+    folder = {
+        "id": "parent",
+        "name": "Show",
+        "path": "/Show/",
+        "size": sum(value["size"] for value in items),
+        "type": {"id": "directory", "files": len(items)},
+        "users": {"user": {"cid": "CID", "hub_url": "adc://hub"}},
+    }
+
+    inspected = await client._inspect_partial_filelist(folder, "Show", 2)
+    assert inspected is not None
+    assert inspected["size"] == sum(100 + episode for episode in range(1, 4))
+    results = client._convert_results([inspected], "Show", 2, (".mkv",))
+    assert len(results) == 1
+    release = results[0]
+    assert release.name == "Show S02 1080p SPANISH"
+    assert [value["name"] for value in release.selected_files] == [
+        f"Show.S02E{episode:02d}.1080p.DUAL.mkv" for episode in range(1, 4)
+    ]
+    assert not release.download_via_filelist
+    assert await client.download(release) == "99"
+    payload = next(
+        content for method, path, content in calls if method == "POST" and path == "/api/v1/queue/bundles/directory"
+    )
+    assert b"S01" not in payload
+    assert payload.count(b"S02E") == 3
+    await http.aclose()
+
+
+async def test_mixed_root_rejects_duplicate_or_gapped_requested_season():
+    def handler(request: httpx.Request):
+        path = request.url.path
+        if path == "/api/v1/filelists" and request.method == "GET":
+            return httpx.Response(200, json=[])
+        if path == "/api/v1/filelists" and request.method == "POST":
+            return httpx.Response(200, json={"id": "CID"})
+        if path == "/api/v1/filelists/CID" and request.method == "GET":
+            return httpx.Response(200, json={"state": {"id": "loaded"}, "location": {"path": "/Show/"}})
+        if path == "/api/v1/filelists/CID/items/0/1000":
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "name": name,
+                            "path": f"/Show/{name}",
+                            "size": 100,
+                            "tth": f"TTH-{index}",
+                            "type": {"id": "file"},
+                        }
+                        for index, name in enumerate(
+                            ("Show.S01E01.mkv", "Show.S03E01.mkv", "Show.S03E03.mkv"), 1
+                        )
+                    ]
+                },
+            )
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        return httpx.Response(404)
+
+    client, http = make_client(handler)
+    folder = {
+        "name": "Show",
+        "path": "/Show/",
+        "size": 300,
+        "type": {"id": "directory", "files": 3},
+        "users": {"user": {"cid": "CID", "hub_url": "adc://hub"}},
+    }
+    assert await client._inspect_partial_filelist(folder, "Show", 3) is None
+    await http.aclose()
+
+
 async def test_open_filelist_location_moves_existing_session():
     requests = []
 
