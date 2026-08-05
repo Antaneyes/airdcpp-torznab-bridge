@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     search_min_accepted_results: int = Field(default=5, ge=1, le=100)
     search_max_variants: int = Field(default=4, ge=1, le=20)
     airdcpp_max_active_searches: int = Field(default=1, ge=1, le=8)
+    season_inspect_max: int = Field(default=10, ge=0, le=50)
+    season_inspect_timeout: float = Field(default=5.0, ge=1.0, le=30.0)
     log_level: str = "INFO"
     testing: bool = False
 

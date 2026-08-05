@@ -22,6 +22,13 @@ class SearchResult(BaseModel):
     published_at: int = Field(default=0, ge=0)
     availability: int = Field(default=1, ge=1)
     languages: list[str] = Field(default_factory=list)
+    # ``name`` es el titulo que deben analizar los ARR. Estos campos conservan
+    # la identidad real del elemento compartido cuando el titulo es sintetico.
+    source_name: str | None = None
+    source_path: str | None = None
+    source_cid: str | None = None
+    source_hub_url: str | None = None
+    download_via_filelist: bool = False
 
 
 class DownloadRecord(BaseModel):

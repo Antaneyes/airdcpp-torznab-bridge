@@ -121,7 +121,9 @@ class MetadataClient:
     async def _tvmaze_titles(self, imdb_id: str | None, tvdb_id: str | None) -> list[str]:
         try:
             params = {"imdb" if imdb_id else "thetvdb": imdb_id or tvdb_id}
-            response = await self.client.get("https://api.tvmaze.com/lookup/shows", params=params)
+            response = await self.client.get(
+                "https://api.tvmaze.com/lookup/shows", params=params, follow_redirects=True
+            )
             if response.status_code == 404:
                 return []
             response.raise_for_status()

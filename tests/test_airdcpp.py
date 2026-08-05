@@ -97,3 +97,134 @@ def test_result_filters_seasons_extensions_and_invalid_items():
     results = client._convert_results(raw, "Show", 1, (".mkv",))
     assert [r.name for r in results] == ["Show Temporada 01"]
     assert results[0].tth is None
+
+
+def test_generic_folder_is_verified_from_descendant_episodes():
+    client, _ = make_client(lambda request: httpx.Response(200))
+    cid = "CID"
+    parent = {
+        "id": "parent",
+        "name": "La casa de los espíritus (2026)",
+        "path": "/Series/La casa de los espíritus (2026)/",
+        "size": 800,
+        "type": {"id": "directory", "directories": 1, "files": 8},
+        "users": {"count": 1, "user": {"cid": cid, "hub_url": "adc://hub"}},
+    }
+    children = [
+        {
+            "id": f"episode-{episode}",
+            "name": f"La casa de los espíritus.S01E{episode:02d}.1080p.WEB-DL.ESP.mkv",
+            "path": f"{parent['path']}S01/episode-{episode}.mkv",
+            "size": 100,
+            "type": {"id": "file"},
+            "users": parent["users"],
+        }
+        for episode in range(1, 9)
+    ]
+
+    results = client._convert_results([parent, *children], "La casa de los espíritus", 1, (".mkv",))
+
+    assert len(results) == 1
+    assert results[0].name == "La casa de los espíritus (2026) S01 1080p WEB DL SPANISH"
+    assert results[0].source_name == parent["name"]
+    assert results[0].source_path == parent["path"]
+
+
+def test_generic_multiseason_or_incomplete_folder_is_not_a_pack():
+    client, _ = make_client(lambda request: httpx.Response(200))
+    parent = {
+        "id": "parent",
+        "name": "Show",
+        "path": "/Show/",
+        "size": 300,
+        "type": {"id": "directory", "files": 3},
+        "users": {"user": {"cid": "CID", "hub_url": "adc://hub"}},
+    }
+    children = [
+        {
+            "id": str(episode),
+            "name": name,
+            "path": f"/Show/{name}",
+            "size": 100,
+            "type": {"id": "file"},
+            "users": parent["users"],
+        }
+        for episode, name in enumerate(("Show.S01E01.mkv", "Show.S01E03.mkv", "Show.S02E01.mkv"), 1)
+    ]
+
+    assert client._convert_results([parent, *children], "Show", 1, (".mkv",)) == []
+
+
+async def test_partial_filelist_recognizes_and_downloads_nested_season():
+    calls = []
+    location = {"path": "/Show/", "name": "Show"}
+
+    def handler(request: httpx.Request):
+        calls.append((request.method, request.url.path))
+        path = request.url.path
+        if path == "/api/v1/filelists" and request.method == "GET":
+            return httpx.Response(200, json=[])
+        if path == "/api/v1/filelists" and request.method == "POST":
+            return httpx.Response(200, json={"id": "CID"})
+        if path == "/api/v1/filelists/CID" and request.method == "GET":
+            return httpx.Response(200, json={"state": {"id": "loaded"}, "location": location})
+        if path == "/api/v1/filelists/CID/directory":
+            location["path"] = "/Show/S01/"
+            return httpx.Response(204)
+        if path == "/api/v1/filelists/CID/items/0/1000":
+            if location["path"] == "/Show/":
+                return httpx.Response(
+                    200,
+                    json={
+                        "items": [
+                            {
+                                "id": 2,
+                                "name": "S01",
+                                "path": "/Show/S01/",
+                                "size": 200,
+                                "type": {"id": "directory", "files": 2},
+                            }
+                        ]
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "id": episode,
+                            "name": f"S01E{episode:02d}.1080p.mkv",
+                            "path": f"/Show/S01/S01E{episode:02d}.1080p.mkv",
+                            "size": 100,
+                            "type": {"id": "file"},
+                        }
+                        for episode in (1, 2)
+                    ]
+                },
+            )
+        if path == "/api/v1/filelists/CID" and request.method == "DELETE":
+            return httpx.Response(204)
+        if path == "/api/v1/filelists/directory_downloads" and request.method == "POST":
+            return httpx.Response(200, json={"id": 55})
+        if path == "/api/v1/filelists/directory_downloads/55":
+            return httpx.Response(200, json={"state": "finished", "queue_info": {"bundle": {"id": 88}}})
+        return httpx.Response(404)
+
+    client, http = make_client(handler)
+    folder = {
+        "id": "parent",
+        "name": "Show",
+        "path": "/Show/",
+        "size": 200,
+        "type": {"id": "directory", "directories": 1, "files": 2},
+        "users": {"user": {"cid": "CID", "hub_url": "adc://hub"}},
+    }
+    inspected = await client._inspect_partial_filelist(folder, "Show", 1)
+    assert inspected is not None
+    results = client._convert_results([inspected], "Show", 1, (".mkv",))
+    assert results[0].name == "Show S01 1080p"
+    assert results[0].source_path == "/Show/S01/"
+    assert results[0].download_via_filelist
+    assert await client.download(results[0]) == "88"
+    assert ("DELETE", "/api/v1/filelists/CID") in calls
+    await http.aclose()

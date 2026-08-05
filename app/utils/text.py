@@ -57,6 +57,17 @@ def season_pattern(season: int) -> re.Pattern[str]:
     return re.compile(rf"\b(?:S|T|Temporada|Season|Staffel|Temp|Part|Pt)\s*[._-]?\s*0?{season}\b", re.I)
 
 
+def episode_marker(value: str) -> tuple[int, int] | None:
+    """Devuelve temporada/episodio para los formatos habituales de scene y carpetas."""
+    normalized = normalize_text(value)
+    match = re.search(r"\bs\s*0?(\d{1,2})\s*e\s*0?(\d{1,3})\b", normalized, re.I)
+    if not match:
+        match = re.search(r"\b0?(\d{1,2})\s*x\s*0?(\d{1,3})\b", normalized, re.I)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
 def detect_languages(value: str) -> list[str]:
     """Detecta solo idiomas declarados; evita inferirlos por el nombre del grupo."""
     normalized = normalize_text(value)

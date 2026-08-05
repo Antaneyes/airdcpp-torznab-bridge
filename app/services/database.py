@@ -7,7 +7,7 @@ import aiosqlite
 
 from app.models import DownloadRecord, DownloadState, SearchResult
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class Repository:
@@ -51,6 +51,11 @@ class Repository:
                     published_at INTEGER NOT NULL DEFAULT 0,
                     availability INTEGER NOT NULL DEFAULT 1,
                     languages TEXT NOT NULL DEFAULT '[]',
+                    source_name TEXT,
+                    source_path TEXT,
+                    source_cid TEXT,
+                    source_hub_url TEXT,
+                    download_via_filelist INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS downloads (
@@ -80,6 +85,11 @@ class Repository:
                 await db.execute("ALTER TABLE releases ADD COLUMN availability INTEGER NOT NULL DEFAULT 1")
             if "languages" not in columns:
                 await db.execute("ALTER TABLE releases ADD COLUMN languages TEXT NOT NULL DEFAULT '[]'")
+            for column in ("source_name", "source_path", "source_cid", "source_hub_url"):
+                if column not in columns:
+                    await db.execute(f"ALTER TABLE releases ADD COLUMN {column} TEXT")
+            if "download_via_filelist" not in columns:
+                await db.execute("ALTER TABLE releases ADD COLUMN download_via_filelist INTEGER NOT NULL DEFAULT 0")
             await self._migrate_legacy(db)
             await db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             await db.commit()
@@ -97,9 +107,11 @@ class Repository:
             size = int(data.get("size", 0))
             await db.execute(
                 """INSERT OR IGNORE INTO releases
-                (release_id,name,size,tth,item_type,source_id,query,published_at,availability,languages,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                (release_id, name, size, tth, "file", None, "legacy", 0, 1, "[]", int(time.time())),
+                (release_id,name,size,tth,item_type,source_id,query,published_at,availability,languages,
+                 source_name,source_path,source_cid,source_hub_url,download_via_filelist,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (release_id, name, size, tth, "file", None, "legacy", 0, 1, "[]", None, None, None, None, 0,
+                 int(time.time())),
             )
             state = DownloadState.COMPLETED if finished_row else DownloadState.QUEUED
             await db.execute(
@@ -142,8 +154,9 @@ class Repository:
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
                 """INSERT OR REPLACE INTO releases
-                (release_id,name,size,tth,item_type,source_id,query,published_at,availability,languages,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (release_id,name,size,tth,item_type,source_id,query,published_at,availability,languages,
+                 source_name,source_path,source_cid,source_hub_url,download_via_filelist,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     result.release_id,
                     result.name,
@@ -155,6 +168,11 @@ class Repository:
                     result.published_at,
                     result.availability,
                     json.dumps(result.languages),
+                    result.source_name,
+                    result.source_path,
+                    result.source_cid,
+                    result.source_hub_url,
+                    int(result.download_via_filelist),
                     int(time.time()),
                 ),
             )
@@ -177,6 +195,11 @@ class Repository:
                     "source_id",
                     "query",
                     "published_at",
+                    "source_name",
+                    "source_path",
+                    "source_cid",
+                    "source_hub_url",
+                    "download_via_filelist",
                 )
             }
             data["availability"] = row["availability"]
