@@ -14,24 +14,32 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-:: Detener contenedores previos si existen
-echo [1/3] Deteniendo contenedores previos...
-docker compose down
+if not exist .env (
+    echo [ERROR] Falta .env. Copia .env.example como .env y configura los secretos.
+    pause
+    exit /b 1
+)
 
-:: Construir la imagen
-echo [2/3] Construyendo el contenedor...
-docker compose build
+echo [1/3] Validando la configuracion...
+docker compose config --quiet
 if %errorlevel% neq 0 (
-    echo [ERROR] Error durante la construcción del contenedor.
+    echo [ERROR] La configuracion de Docker Compose no es valida.
     pause
     exit /b %errorlevel%
 )
 
-:: Lanzar en modo interactivo para ver los logs inicialmente
-echo [3/3] Lanzando el puente...
+echo [2/3] Descargando la imagen configurada...
+docker compose pull
+if %errorlevel% neq 0 (
+    echo [ERROR] No se pudo descargar la imagen.
+    pause
+    exit /b %errorlevel%
+)
+
+echo [3/3] Iniciando el bridge...
+docker compose up -d
+docker compose ps
 echo.
-echo Presiona Ctrl+C para detener el bridge si es necesario.
-echo.
-docker compose up
+echo Usa "docker compose logs -f --tail=200" para ver los logs.
 
 pause

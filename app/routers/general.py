@@ -3,6 +3,8 @@ import urllib.parse
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import RedirectResponse
 
+from app import __version__
+from app.core.security import validate_api_key
 from app.services.airdcpp import AirDCError
 from app.utils.xml import COMPAT_TRACKER, error_xml
 
@@ -11,6 +13,7 @@ router = APIRouter()
 
 @router.get("/browse/{release_id}")
 async def browse_release(release_id: str, request: Request) -> Response:
+    validate_api_key(request, request.app.state.settings)
     release = await request.app.state.repository.get_release(release_id)
     if not release:
         return Response("El resultado ha caducado o no existe", status_code=404)
@@ -24,7 +27,7 @@ async def browse_release(release_id: str, request: Request) -> Response:
 @router.get("/health")
 @router.get("/health/live")
 async def live(request: Request) -> dict:
-    return {"status": "ok", "version": "2.0.0-beta.1", "hashes": await request.app.state.repository.count_hashes()}
+    return {"status": "ok", "version": __version__, "hashes": await request.app.state.repository.count_hashes()}
 
 
 @router.get("/health/ready")

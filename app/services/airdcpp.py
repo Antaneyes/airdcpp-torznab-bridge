@@ -314,18 +314,23 @@ class AirDCClient:
         try:
             existing = await self.http.get(f"{self.settings.airdcpp_url}/api/v1/filelists", headers=self.headers)
             existing.raise_for_status()
-            if any(str(value.get("id")) == cid for value in existing.json()):
-                logger.info("Inspeccion omitida cid=%s: la lista ya estaba abierta", cid)
-                return None
-            response = await self.http.post(
-                f"{self.settings.airdcpp_url}/api/v1/filelists",
-                json={"user": {"cid": cid, "hub_url": hub_url}, "directory": root_path},
-                headers=self.headers,
-            )
-            if response.status_code == 409:
-                return None
-            response.raise_for_status()
-            opened = True
+            current = next((value for value in existing.json() if str(value.get("id")) == cid), None)
+            if current:
+                current_path = str((current.get("location") or {}).get("path") or "")
+                if current_path != root_path:
+                    logger.info("Inspeccion omitida cid=%s: la lista estaba abierta en otra ruta", cid)
+                    return None
+                logger.info("Reutilizando lista abierta cid=%s en la ruta solicitada", cid)
+            else:
+                response = await self.http.post(
+                    f"{self.settings.airdcpp_url}/api/v1/filelists",
+                    json={"user": {"cid": cid, "hub_url": hub_url}, "directory": root_path},
+                    headers=self.headers,
+                )
+                if response.status_code == 409:
+                    return None
+                response.raise_for_status()
+                opened = True
             if not await self._wait_filelist(cid):
                 return None
             items = await self._filelist_items(cid)
@@ -342,6 +347,9 @@ class AirDCClient:
                     break
             target_path = str((target or folder).get("path") or root_path)
             if target:
+                if not opened:
+                    logger.info("Inspeccion omitida cid=%s: no se movera una lista abierta por el usuario", cid)
+                    return None
                 changed = await self.http.post(
                     f"{self.settings.airdcpp_url}/api/v1/filelists/{cid}/directory",
                     json={"list_path": target_path},

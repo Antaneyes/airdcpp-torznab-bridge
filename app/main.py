@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Request
 
+from app import __version__
 from app.config import Settings, get_settings
 from app.core.logging import setup_logging
 from app.routers import general, qbittorrent, torznab
@@ -44,7 +45,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     application = FastAPI(
         title="AirDC++ Torznab/qBittorrent Bridge",
-        version="2.0.0-beta.1",
+        version=__version__,
         docs_url=None,
         redoc_url=None,
         lifespan=lifespan,

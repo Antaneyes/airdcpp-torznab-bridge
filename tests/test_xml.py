@@ -46,8 +46,8 @@ def test_feed_contains_stable_release_contract():
 
 def test_feed_can_link_release_title_to_browse_endpoint():
     result = SearchResult(release_id="b" * 40, name="Show S01", size=123)
-    xml = feed_xml([result], "https://bridge.example", "", "5000", 1, None, browse_enabled=True)
+    xml = feed_xml([result], "https://bridge.example", "secret key", "5000", 1, None, browse_enabled=True)
     item = ET.fromstring(xml).find("./channel/item")
 
     assert item is not None
-    assert item.findtext("comments") == f"https://bridge.example/browse/{'b' * 40}"
+    assert item.findtext("comments") == f"https://bridge.example/browse/{'b' * 40}?apikey=secret%20key"

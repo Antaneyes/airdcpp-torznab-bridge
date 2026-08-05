@@ -31,6 +31,29 @@ async def test_migrates_legacy_database_without_changing_hash(tmp_path):
     assert list(tmp_path.glob("bridge.db.v0.bak-*"))
 
 
+async def test_imports_v1_json_idempotently_and_keeps_backup(tmp_path):
+    legacy = {
+        "hashes": {"TTH-ACTIVE": "a" * 40, "TTH-DONE": "b" * 40},
+        "bundles": {"12": "TTH-ACTIVE", "13": "TTH-DONE"},
+        "categories": {"12": "sonarr", "13": "airdcpp"},
+        "finished": {"TTH-DONE": {"name": "Finished.mkv", "size": 42, "progress": 1}},
+    }
+    (tmp_path / "bridge_hashes.json").write_text(json.dumps(legacy), encoding="utf-8")
+
+    repository = Repository(tmp_path / "bridge.db")
+    await repository.initialize()
+    await repository.initialize()
+
+    assert await repository.tth_for_hash("a" * 40) == "TTH-ACTIVE"
+    active = await repository.get_download("a" * 40)
+    finished = await repository.get_download("b" * 40)
+    assert active is not None and active.bundle_id == "12" and active.category == "sonarr"
+    assert finished is not None and finished.name == "Finished.mkv" and finished.category == "airdcpp"
+    assert finished.state == "completed"
+    assert (tmp_path / "bridge_hashes.json.v1.bak").read_text(encoding="utf-8") == json.dumps(legacy)
+    assert len(await repository.list_downloads()) == 2
+
+
 async def test_repository_crud(tmp_path):
     repository = Repository(tmp_path / "new.db")
     await repository.initialize()

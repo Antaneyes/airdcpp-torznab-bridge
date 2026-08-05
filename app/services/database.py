@@ -93,9 +93,51 @@ class Repository:
                 await db.execute("ALTER TABLE releases ADD COLUMN download_via_filelist INTEGER NOT NULL DEFAULT 0")
             if "selected_files" not in columns:
                 await db.execute("ALTER TABLE releases ADD COLUMN selected_files TEXT NOT NULL DEFAULT '[]'")
+            await self._import_v1_json(db)
             await self._migrate_legacy(db)
             await db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             await db.commit()
+
+    async def _import_v1_json(self, db: aiosqlite.Connection) -> None:
+        """Importa de forma idempotente la persistencia JSON usada por v1."""
+        legacy_path = self.path.parent / "bridge_hashes.json"
+        if not legacy_path.is_file():
+            return
+        backup_path = self.path.parent / "bridge_hashes.json.v1.bak"
+        if not backup_path.exists():
+            shutil.copy2(legacy_path, backup_path)
+        try:
+            data = json.loads(legacy_path.read_text(encoding="utf-8") or "{}")
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return
+        if not isinstance(data, dict):
+            return
+        if "hashes" in data:
+            hashes = data.get("hashes", {})
+            bundles = data.get("bundles", {})
+            categories = data.get("categories", {})
+            finished = data.get("finished", {})
+        else:
+            hashes, bundles, categories, finished = data, {}, {}, {}
+        if isinstance(hashes, dict):
+            await db.executemany(
+                "INSERT OR IGNORE INTO hashes(tth,hex) VALUES(?,?)",
+                [(str(tth), str(hex_hash)) for tth, hex_hash in hashes.items() if tth and hex_hash],
+            )
+        if isinstance(bundles, dict):
+            await db.executemany(
+                "INSERT OR IGNORE INTO bundles(bundle_id,tth,category) VALUES(?,?,?)",
+                [
+                    (str(bundle_id), str(tth), str(categories.get(bundle_id, "radarr")))
+                    for bundle_id, tth in bundles.items()
+                    if bundle_id and tth
+                ],
+            )
+        if isinstance(finished, dict):
+            await db.executemany(
+                "INSERT OR IGNORE INTO finished(tth,data) VALUES(?,?)",
+                [(str(tth), json.dumps(value)) for tth, value in finished.items() if tth],
+            )
 
     async def _migrate_legacy(self, db: aiosqlite.Connection) -> None:
         rows = await (await db.execute("SELECT bundle_id, tth, category FROM bundles")).fetchall()

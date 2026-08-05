@@ -338,6 +338,49 @@ async def test_mixed_root_rejects_duplicate_or_gapped_requested_season():
     await http.aclose()
 
 
+async def test_partial_filelist_reuses_existing_list_at_same_mixed_root():
+    calls = []
+
+    def handler(request: httpx.Request):
+        calls.append((request.method, request.url.path))
+        if request.url.path == "/api/v1/filelists" and request.method == "GET":
+            return httpx.Response(200, json=[{"id": "CID", "location": {"path": "/Show/"}}])
+        if request.url.path == "/api/v1/filelists/CID" and request.method == "GET":
+            return httpx.Response(200, json={"state": {"id": "loaded"}, "location": {"path": "/Show/"}})
+        if request.url.path == "/api/v1/filelists/CID/items/0/1000":
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "name": f"Show.S{season:02d}E{episode:02d}.mkv",
+                            "path": f"/Show/Show.S{season:02d}E{episode:02d}.mkv",
+                            "size": 100,
+                            "tth": f"TTH-{season}-{episode}",
+                            "type": {"id": "file"},
+                        }
+                        for season, episode in ((1, 1), (2, 1), (2, 2))
+                    ]
+                },
+            )
+        return httpx.Response(404)
+
+    client, http = make_client(handler)
+    folder = {
+        "name": "Show",
+        "path": "/Show/",
+        "size": 300,
+        "type": {"id": "directory", "files": 3},
+        "users": {"user": {"cid": "CID", "hub_url": "adc://hub"}},
+    }
+    inspected = await client._inspect_partial_filelist(folder, "Show", 2)
+    assert inspected is not None
+    assert len(inspected["_selected_files"]) == 2
+    assert ("POST", "/api/v1/filelists") not in calls
+    assert ("DELETE", "/api/v1/filelists/CID") not in calls
+    await http.aclose()
+
+
 async def test_open_filelist_location_moves_existing_session():
     requests = []
 

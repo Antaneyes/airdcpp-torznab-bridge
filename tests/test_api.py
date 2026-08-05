@@ -75,6 +75,23 @@ def test_torznab_rejects_bad_api_key(tmp_path):
         assert "API key" in response.text
 
 
+def test_browse_endpoint_requires_api_key(tmp_path):
+    app = create_app(
+        settings(
+            tmp_path,
+            testing=False,
+            airdcpp_user="air",
+            airdcpp_pass="pass",
+            bridge_api_key="api",
+            bridge_username="arr",
+            bridge_password="secret",
+        )
+    )
+    with TestClient(app) as client:
+        assert client.get("/browse/missing").status_code == 401
+        assert client.get("/browse/missing", params={"apikey": "api"}).status_code == 404
+
+
 def test_qbittorrent_contract_and_download_lifecycle(tmp_path):
     app = create_app(settings(tmp_path))
     release = SearchResult(release_id="a" * 40, name="Movie.mkv", size=100, tth="TTH", languages=["Spanish"])

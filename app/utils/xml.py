@@ -59,6 +59,8 @@ def feed_xml(
             download += "&apikey=" + urllib.parse.quote(api_key, safe="")
         ET.SubElement(item, "link").text = magnet
         comments = f"{base_url}/browse/{result.release_id}" if browse_enabled else base_url
+        if browse_enabled and api_key:
+            comments += "?apikey=" + urllib.parse.quote(api_key, safe="")
         ET.SubElement(item, "comments").text = comments
         published_at = result.published_at or int(time.time())
         ET.SubElement(item, "pubDate").text = email.utils.formatdate(published_at, usegmt=True)
