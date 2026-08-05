@@ -1,12 +1,12 @@
-FROM python:3.13-slim-bookworm AS builder
+FROM python:3.13-alpine AS builder
 WORKDIR /build
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1
 COPY requirements.txt .
 RUN python -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
-FROM python:3.13-slim-bookworm
+FROM python:3.13-alpine
 ENV PATH="/opt/venv/bin:$PATH" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
-RUN groupadd --gid 10001 bridge && useradd --uid 10001 --gid bridge --no-create-home --home-dir /app bridge
+RUN addgroup -g 10001 -S bridge && adduser -u 10001 -S -D -H -h /app -G bridge bridge
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 COPY --chown=bridge:bridge app ./app
