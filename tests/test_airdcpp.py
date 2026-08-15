@@ -232,6 +232,7 @@ def test_generic_multiseason_or_incomplete_folder_is_not_a_pack():
 
 async def test_partial_filelist_recognizes_and_downloads_nested_season():
     calls = []
+    directory_download_payloads = []
     location = {"path": "/Show/", "name": "Show"}
 
     def handler(request: httpx.Request):
@@ -280,6 +281,7 @@ async def test_partial_filelist_recognizes_and_downloads_nested_season():
         if path == "/api/v1/filelists/CID" and request.method == "DELETE":
             return httpx.Response(204)
         if path == "/api/v1/filelists/directory_downloads" and request.method == "POST":
+            directory_download_payloads.append(request.read())
             return httpx.Response(200, json={"id": 55})
         if path == "/api/v1/filelists/directory_downloads/55":
             return httpx.Response(200, json={"state": "finished", "queue_info": {"bundle": {"id": 88}}})
@@ -301,6 +303,8 @@ async def test_partial_filelist_recognizes_and_downloads_nested_season():
     assert results[0].source_path == "/Show/S01/"
     assert results[0].download_via_filelist
     assert await client.download(results[0]) == "88"
+    assert b'"target_name":"Show S01 1080p"' in directory_download_payloads[0]
+    assert b'"target_directory":"/downloads/"' in directory_download_payloads[0]
     assert ("DELETE", "/api/v1/filelists/CID") in calls
     await http.aclose()
 
@@ -367,6 +371,8 @@ async def test_partial_filelist_selects_only_requested_season_from_mixed_root():
     )
     assert b"S01" not in payload
     assert payload.count(b"S02E") == 3
+    assert b'"target_name":"Show S02 1080p SPANISH"' in payload
+    assert b'"target_directory":"/downloads/"' in payload
     await http.aclose()
 
 

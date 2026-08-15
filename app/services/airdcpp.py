@@ -473,12 +473,14 @@ class AirDCClient:
         """Crea un unico bundle con los episodios elegidos de una carpeta multitemporada."""
         if not release.source_cid or not release.source_hub_url:
             raise AirDCError("Faltan datos de origen para descargar la temporada seleccionada")
+        target_directory = f"{self.settings.save_path.rstrip('/')}/"
         try:
             response = await self.http.post(
                 f"{self.settings.airdcpp_url}/api/v1/queue/bundles/directory",
                 json={
                     "user": {"cid": release.source_cid, "hub_url": release.source_hub_url},
                     "target_name": release.name,
+                    "target_directory": target_directory,
                     "priority": 3,
                     "files": [
                         {**value, "priority": 3}
@@ -499,12 +501,15 @@ class AirDCClient:
     async def _download_filelist_directory(self, release: SearchResult) -> str:
         if not all((release.source_path, release.source_cid, release.source_hub_url)):
             raise AirDCError("Faltan datos de origen para descargar la carpeta validada")
+        target_directory = f"{self.settings.save_path.rstrip('/')}/"
         try:
             response = await self.http.post(
                 f"{self.settings.airdcpp_url}/api/v1/filelists/directory_downloads",
                 json={
                     "user": {"cid": release.source_cid, "hub_url": release.source_hub_url},
                     "list_path": release.source_path,
+                    "target_name": release.name,
+                    "target_directory": target_directory,
                     "priority": 3,
                 },
                 headers=self.headers,
