@@ -12,7 +12,7 @@ Esta guía ofrece dos opciones:
 1. Localiza la carpeta que contiene el `docker-compose.yml` de v1 y entra en ella.
 2. Comprueba que `data/bridge_hashes.json` existe. Si utilizaste otro montaje, localiza el directorio conectado a `/app/data`.
 3. No ejecutes v1 y v2 simultáneamente sobre el mismo directorio `data`.
-4. Usa inicialmente la versión numerada `2.0.0-beta.3`, no `latest` ni la etiqueta móvil `beta`.
+4. Usa inicialmente la versión numerada `2.0.0-beta.4`, no `latest` ni la etiqueta móvil `beta`.
 
 ## Opción A: sustitución directa conservando puerto y datos
 
@@ -35,7 +35,7 @@ No elimines el contenedor con sus volúmenes si utilizabas un volumen Docker en 
 Copia `.env.example` de v2 como `.env` y edita, como mínimo, estos valores:
 
 ```env
-BRIDGE_IMAGE_TAG=2.0.0-beta.3
+BRIDGE_IMAGE_TAG=2.0.0-beta.4
 BRIDGE_PORT=8000
 
 AIRDCPP_URL=http://host.docker.internal:5600
@@ -68,7 +68,7 @@ Para conservar el directorio `./data` y el puerto anterior, usa:
 ```yaml
 services:
   airdcpp-bridge:
-    image: ghcr.io/antaneyes/airdcpp-torznab-bridge:${BRIDGE_IMAGE_TAG:-2.0.0-beta.3}
+    image: ghcr.io/antaneyes/airdcpp-torznab-bridge:${BRIDGE_IMAGE_TAG:-2.0.0-beta.4}
     container_name: airdcpp-bridge
     ports:
       - "${BRIDGE_PORT:-8000}:8000"

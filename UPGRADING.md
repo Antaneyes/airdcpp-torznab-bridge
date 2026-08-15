@@ -9,7 +9,7 @@ For the complete step-by-step guide in Spanish, see [docs/es/UPGRADING.md](docs/
 1. Stop v1 and back up the directory or Docker volume mounted at `/app/data`.
 2. Confirm that it contains `bridge_hashes.json`.
 3. Do not run v1 and v2 against the same data directory at the same time.
-4. Pin `2.0.0-beta.3` initially instead of using the moving `beta` tag.
+4. Pin `2.0.0-beta.4` initially instead of using the moving `beta` tag.
 
 ## In-place upgrade (recommended)
 
@@ -28,7 +28,7 @@ This route preserves the old URL and port.
 2. Copy v2's `.env.example` to `.env`. At minimum, configure:
 
    ```env
-   BRIDGE_IMAGE_TAG=2.0.0-beta.3
+   BRIDGE_IMAGE_TAG=2.0.0-beta.4
    BRIDGE_PORT=8000
    AIRDCPP_URL=http://host.docker.internal:5600
    AIRDCPP_USER=YOUR_AIRDCPP_USER
@@ -46,7 +46,7 @@ This route preserves the old URL and port.
    ```yaml
    services:
      airdcpp-bridge:
-       image: ghcr.io/antaneyes/airdcpp-torznab-bridge:${BRIDGE_IMAGE_TAG:-2.0.0-beta.3}
+       image: ghcr.io/antaneyes/airdcpp-torznab-bridge:${BRIDGE_IMAGE_TAG:-2.0.0-beta.4}
        container_name: airdcpp-bridge
        ports:
          - "${BRIDGE_PORT:-8000}:8000"

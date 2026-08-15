@@ -1,3 +1,5 @@
+import asyncio
+
 import httpx
 import pytest
 from pydantic import SecretStr
@@ -232,6 +234,7 @@ def test_generic_multiseason_or_incomplete_folder_is_not_a_pack():
 
 async def test_partial_filelist_recognizes_and_downloads_nested_season():
     calls = []
+    directory_download_payloads = []
     location = {"path": "/Show/", "name": "Show"}
 
     def handler(request: httpx.Request):
@@ -280,6 +283,7 @@ async def test_partial_filelist_recognizes_and_downloads_nested_season():
         if path == "/api/v1/filelists/CID" and request.method == "DELETE":
             return httpx.Response(204)
         if path == "/api/v1/filelists/directory_downloads" and request.method == "POST":
+            directory_download_payloads.append(request.read())
             return httpx.Response(200, json={"id": 55})
         if path == "/api/v1/filelists/directory_downloads/55":
             return httpx.Response(200, json={"state": "finished", "queue_info": {"bundle": {"id": 88}}})
@@ -301,6 +305,8 @@ async def test_partial_filelist_recognizes_and_downloads_nested_season():
     assert results[0].source_path == "/Show/S01/"
     assert results[0].download_via_filelist
     assert await client.download(results[0]) == "88"
+    assert b'"target_name":"Show S01 1080p"' in directory_download_payloads[0]
+    assert b'"target_directory":"/downloads/"' in directory_download_payloads[0]
     assert ("DELETE", "/api/v1/filelists/CID") in calls
     await http.aclose()
 
@@ -367,6 +373,8 @@ async def test_partial_filelist_selects_only_requested_season_from_mixed_root():
     )
     assert b"S01" not in payload
     assert payload.count(b"S02E") == 3
+    assert b'"target_name":"Show S02 1080p SPANISH"' in payload
+    assert b'"target_directory":"/downloads/"' in payload
     await http.aclose()
 
 
@@ -458,13 +466,17 @@ async def test_partial_filelist_reuses_existing_list_at_same_mixed_root():
 
 async def test_open_filelist_location_moves_existing_session():
     requests = []
+    location = {"path": "/Elsewhere/"}
 
     def handler(request: httpx.Request):
         requests.append((request.method, request.url.path, request.content))
         if request.url.path == "/api/v1/filelists" and request.method == "GET":
             return httpx.Response(200, json=[{"id": "CID"}])
         if request.url.path == "/api/v1/filelists/CID/directory":
+            location["path"] = "/Series/Show/S01/"
             return httpx.Response(204)
+        if request.url.path == "/api/v1/filelists/CID":
+            return httpx.Response(200, json={"state": {"id": "loaded"}, "location": location})
         return httpx.Response(404)
 
     client, http = make_client(handler)
@@ -481,4 +493,103 @@ async def test_open_filelist_location_moves_existing_session():
 
     assert await client.open_filelist_location(release) == "https://airdc.example/filelists/session/CID"
     assert ("POST", "/api/v1/filelists/CID/directory", b'{"list_path":"/Series/Show/S01/"}') in requests
+    await http.aclose()
+
+
+async def test_partial_filelist_moves_existing_session_and_restores_original_path():
+    calls = []
+    location = {"path": "/What/I/Was/Browsing/"}
+
+    def handler(request: httpx.Request):
+        path = request.url.path
+        if path == "/api/v1/filelists" and request.method == "GET":
+            return httpx.Response(200, json=[{"id": "CID"}])
+        if path == "/api/v1/filelists/CID" and request.method == "GET":
+            return httpx.Response(200, json={"state": {"id": "loaded"}, "location": location})
+        if path == "/api/v1/filelists/CID/directory":
+            requested = request.content.decode().split('"list_path":"', 1)[1].split('"', 1)[0]
+            calls.append(requested)
+            location["path"] = requested
+            return httpx.Response(204)
+        if path == "/api/v1/filelists/CID/items/0/1000":
+            if location["path"] == "/Series/Show/":
+                return httpx.Response(
+                    200,
+                    json={
+                        "list_path": location["path"],
+                        "items": [
+                            {
+                                "name": "Temporada 03",
+                                "path": "/Series/Show/Temporada 03/",
+                                "size": 200,
+                                "type": {"id": "directory", "files": 2},
+                            }
+                        ],
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "list_path": location["path"],
+                    "items": [
+                        {
+                            "name": f"Show.S03E{episode:02d}.1080p.mkv",
+                            "size": 100,
+                            "type": {"id": "file"},
+                        }
+                        for episode in (1, 2)
+                    ],
+                },
+            )
+        return httpx.Response(404)
+
+    client, http = make_client(handler)
+    folder = {
+        "name": "Show",
+        "path": "/Series/Show/",
+        "size": 200,
+        "type": {"id": "directory", "files": 2},
+        "users": {"user": {"cid": "CID", "hub_url": "adc://hub"}},
+    }
+
+    inspected = await client._inspect_partial_filelist(folder, "Show", 3)
+
+    assert inspected is not None
+    assert inspected["_verified_display"] == "Show S03 1080p"
+    assert calls == [
+        "/Series/Show/",
+        "/Series/Show/Temporada 03/",
+        "/What/I/Was/Browsing/",
+    ]
+    assert location["path"] == "/What/I/Was/Browsing/"
+    await http.aclose()
+
+
+async def test_filelist_lock_serializes_same_cid_and_allows_different_cids():
+    client, http = make_client(lambda _: httpx.Response(404))
+    active_same_cid = 0
+    max_same_cid = 0
+    different_cid_entered = asyncio.Event()
+
+    async def same_cid_worker():
+        nonlocal active_same_cid, max_same_cid
+        async with client._filelist_lock("CID"):
+            active_same_cid += 1
+            max_same_cid = max(max_same_cid, active_same_cid)
+            await asyncio.sleep(0.02)
+            active_same_cid -= 1
+
+    async def different_cid_worker():
+        async with client._filelist_lock("OTHER"):
+            different_cid_entered.set()
+            await asyncio.sleep(0.01)
+
+    first = asyncio.create_task(same_cid_worker())
+    second = asyncio.create_task(same_cid_worker())
+    other = asyncio.create_task(different_cid_worker())
+    await asyncio.wait_for(different_cid_entered.wait(), timeout=0.1)
+    await asyncio.gather(first, second, other)
+
+    assert max_same_cid == 1
+    assert client._filelist_locks == {}
     await http.aclose()

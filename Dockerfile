@@ -2,11 +2,15 @@ FROM python:3.13-alpine AS builder
 WORKDIR /build
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1
 COPY requirements.txt .
-RUN python -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
+RUN python -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt \
+    && rm -rf /opt/venv/lib/python*/site-packages/pip* /opt/venv/bin/pip*
 
 FROM python:3.13-alpine
 ENV PATH="/opt/venv/bin:$PATH" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
-RUN addgroup -g 10001 -S bridge && adduser -u 10001 -S -D -H -h /app -G bridge bridge
+RUN rm -rf /usr/local/lib/python*/site-packages/pip* /usr/local/bin/pip* \
+    && addgroup -g 10001 -S bridge \
+    && adduser -u 10001 -S -D -H -h /app -G bridge bridge
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 COPY --chown=bridge:bridge app ./app

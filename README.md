@@ -44,7 +44,7 @@ docker compose ps
 curl http://localhost:8001/health/ready
 ```
 
-The compose file uses `ghcr.io/antaneyes/airdcpp-torznab-bridge:beta`. Pin `BRIDGE_IMAGE_TAG=2.0.0-beta.3` in `.env` for fully reproducible upgrades.
+The compose file uses `ghcr.io/antaneyes/airdcpp-torznab-bridge:beta`. Pin `BRIDGE_IMAGE_TAG=2.0.0-beta.4` in `.env` for fully reproducible upgrades.
 
 If AirDC++ is another container on the same Docker network, set `AIRDCPP_URL=http://airdcpp:5600` and attach the bridge to that network. If AirDC++ publishes port 5600 on the Docker host, the default `http://host.docker.internal:5600` works with the included `extra_hosts` entry.
 
