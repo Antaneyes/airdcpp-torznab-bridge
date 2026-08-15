@@ -9,6 +9,7 @@ All notable changes are documented here. This project follows semantic versionin
 - Season downloads now use Sonarr-compatible bundle names and stay inside the configured AirDC++ download directory.
 - Season inspection now works when the same user's file list is already open in another directory.
 - Concurrent searches and result links coordinate file-list navigation per user and restore the previous directory after inspection.
+- The runtime image no longer includes `pip` or its unused vendored build dependencies.
 
 ## [2.0.0-beta.3] - 2026-08-05
 
