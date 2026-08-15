@@ -39,7 +39,7 @@ docker compose ps
 curl http://localhost:8001/health/ready
 ```
 
-La imagen predeterminada es `ghcr.io/antaneyes/airdcpp-torznab-bridge:beta`. Para fijar la versión usa `BRIDGE_IMAGE_TAG=2.0.0-beta.3`.
+La imagen predeterminada es `ghcr.io/antaneyes/airdcpp-torznab-bridge:beta`. Para fijar la versión usa `BRIDGE_IMAGE_TAG=2.0.0-beta.4`.
 
 Si AirDC++ está en otro contenedor de la misma red Docker, usa `AIRDCPP_URL=http://airdcpp:5600` y conecta el bridge a esa red. Si AirDC++ publica el puerto 5600 en el host, usa `http://host.docker.internal:5600` con el `extra_hosts` incluido.
 
