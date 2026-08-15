@@ -5,6 +5,9 @@ import logging
 import re
 import time
 import urllib.parse
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 
 import httpx
 
@@ -19,11 +22,38 @@ class AirDCError(RuntimeError):
     pass
 
 
+@dataclass
+class _FilelistLockEntry:
+    lock: asyncio.Lock
+    users: int = 0
+
+
 class AirDCClient:
     def __init__(self, http: httpx.AsyncClient, settings: Settings):
         self.http = http
         self.settings = settings
         self.search_semaphore = asyncio.Semaphore(settings.airdcpp_max_active_searches)
+        self._filelist_locks_guard = asyncio.Lock()
+        self._filelist_locks: dict[str, _FilelistLockEntry] = {}
+
+    @asynccontextmanager
+    async def _filelist_lock(self, cid: str) -> AsyncIterator[None]:
+        """Serializa todos los movimientos de una misma lista remota."""
+        async with self._filelist_locks_guard:
+            entry = self._filelist_locks.setdefault(cid, _FilelistLockEntry(asyncio.Lock()))
+            entry.users += 1
+        acquired = False
+        try:
+            await entry.lock.acquire()
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                entry.lock.release()
+            async with self._filelist_locks_guard:
+                entry.users -= 1
+                if entry.users == 0 and self._filelist_locks.get(cid) is entry:
+                    del self._filelist_locks[cid]
 
     @property
     def headers(self) -> dict[str, str]:
@@ -333,111 +363,122 @@ class AirDCClient:
         if not cid or not hub_url or not root_path:
             return None
 
-        opened = False
-        try:
-            existing = await self.http.get(f"{self.settings.airdcpp_url}/api/v1/filelists", headers=self.headers)
-            existing.raise_for_status()
-            current = next((value for value in existing.json() if str(value.get("id")) == cid), None)
-            if current:
-                current_path = str((current.get("location") or {}).get("path") or "")
-                if current_path != root_path:
-                    logger.info("Inspeccion omitida cid=%s: la lista estaba abierta en otra ruta", cid)
-                    return None
-                logger.info("Reutilizando lista abierta cid=%s en la ruta solicitada", cid)
-            else:
-                response = await self.http.post(
-                    f"{self.settings.airdcpp_url}/api/v1/filelists",
-                    json={"user": {"cid": cid, "hub_url": hub_url}, "directory": root_path},
-                    headers=self.headers,
-                )
-                if response.status_code == 409:
-                    return None
-                response.raise_for_status()
-                opened = True
-            if not await self._wait_filelist(cid):
-                return None
-            items = await self._filelist_items(cid)
-
-            # Si existe una subcarpeta de temporada, se descarga esa ruta y no
-            # la raiz completa (que podria contener otras temporadas).
-            target = None
-            for candidate in items:
-                raw_type = candidate.get("type", {})
-                if isinstance(raw_type, dict) and raw_type.get("id") == "directory" and season_pattern(season).search(
-                    str(candidate.get("name") or "")
-                ):
-                    target = candidate
-                    break
-            target_path = str((target or folder).get("path") or root_path)
-            if target:
-                if not opened:
-                    logger.info("Inspeccion omitida cid=%s: no se movera una lista abierta por el usuario", cid)
-                    return None
-                changed = await self.http.post(
-                    f"{self.settings.airdcpp_url}/api/v1/filelists/{cid}/directory",
-                    json={"list_path": target_path},
-                    headers=self.headers,
-                )
-                changed.raise_for_status()
-                if not await self._wait_filelist(cid, target_path):
-                    return None
-                items = await self._filelist_items(cid)
-
-            all_videos = [
-                value
-                for value in items
-                if str(value.get("type", {}).get("id", "")) == "file"
-                and str(value.get("name") or "").lower().endswith(
-                    (".mkv", ".avi", ".mp4", ".m4v", ".mov", ".wmv", ".mpg", ".mpeg")
-                )
-            ]
-            videos = all_videos
-            mixed_root = False
-            if not target:
-                marked = [(value, episode_marker(str(value.get("name") or ""))) for value in all_videos]
-                videos = [value for value, marker in marked if marker and marker[0] == season]
-                mixed_root = any(marker and marker[0] != season for _, marker in marked)
-            markers = [episode_marker(str(value.get("name") or "")) for value in videos]
-            if len(markers) < 2 or any(marker is None or marker[0] != season for marker in markers):
-                return None
-            episodes = sorted({marker[1] for marker in markers if marker})
-            if len(episodes) != len(markers) or episodes != list(range(1, episodes[-1] + 1)):
-                return None
-            selected_files: list[dict[str, str | int]] = []
-            if mixed_root:
-                for value in videos:
-                    tth = str(value.get("tth") or "")
-                    size = int(float(value.get("size", 0) or 0))
-                    name = str(value.get("name") or "")
-                    if not tth or not name or size <= 0:
+        async with self._filelist_lock(cid):
+            opened = False
+            original_path = ""
+            restore_needed = False
+            try:
+                existing = await self.http.get(f"{self.settings.airdcpp_url}/api/v1/filelists", headers=self.headers)
+                existing.raise_for_status()
+                current = next((value for value in existing.json() if str(value.get("id")) == cid), None)
+                if current:
+                    if not await self._wait_filelist(cid):
                         return None
-                    selected_files.append({"name": name, "size": size, "tth": tth})
-            selected = target or folder
-            suffix = self._common_technical_suffix([str(value.get("name") or "") for value in videos])
-            display = f"{folder.get('name') or query} S{season:02d}" + (f" {suffix}" if suffix else "")
-            return {
-                **selected,
-                "id": f"filelist:{cid}:{target_path}",
-                "name": str(selected.get("name") or folder.get("name") or query),
-                "path": target_path,
-                "users": folder.get("users"),
-                "hits": folder.get("hits", 1),
-                "time": selected.get("time", folder.get("time", 0)),
-                "_verified_display": display,
-                "size": sum(int(float(value.get("size", 0) or 0)) for value in videos),
-                "type": {"id": "bundle", "files": len(videos)},
-                "_download_via_filelist": not mixed_root,
-                "_selected_files": selected_files,
-            }
-        except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
-            logger.info("No se pudo inspeccionar la carpeta %r: %s", folder.get("name"), exc)
-            return None
-        finally:
-            if opened:
-                try:
-                    await self.http.delete(f"{self.settings.airdcpp_url}/api/v1/filelists/{cid}", headers=self.headers)
-                except httpx.HTTPError:
-                    logger.warning("No se pudo cerrar la lista parcial %s", cid)
+                    original_path = await self._filelist_path(cid)
+                    if original_path != root_path:
+                        await self._change_filelist_directory(cid, root_path)
+                        restore_needed = True
+                    logger.info(
+                        "Reutilizando lista abierta cid=%s ruta_inicial=%r ruta_inspeccion=%r",
+                        cid,
+                        original_path,
+                        root_path,
+                    )
+                else:
+                    response = await self.http.post(
+                        f"{self.settings.airdcpp_url}/api/v1/filelists",
+                        json={"user": {"cid": cid, "hub_url": hub_url}, "directory": root_path},
+                        headers=self.headers,
+                    )
+                    if response.status_code == 409:
+                        return None
+                    response.raise_for_status()
+                    opened = True
+                    if not await self._wait_filelist(cid, root_path):
+                        return None
+                items = await self._filelist_items(cid, root_path)
+
+                # Si existe una subcarpeta de temporada, se descarga esa ruta y no
+                # la raiz completa (que podria contener otras temporadas).
+                target = None
+                for candidate in items:
+                    raw_type = candidate.get("type", {})
+                    if (
+                        isinstance(raw_type, dict)
+                        and raw_type.get("id") == "directory"
+                        and season_pattern(season).search(str(candidate.get("name") or ""))
+                    ):
+                        target = candidate
+                        break
+                target_path = str((target or folder).get("path") or root_path)
+                if target:
+                    await self._change_filelist_directory(cid, target_path)
+                    restore_needed = restore_needed or bool(original_path and original_path != target_path)
+                    items = await self._filelist_items(cid, target_path)
+
+                all_videos = [
+                    value
+                    for value in items
+                    if str(value.get("type", {}).get("id", "")) == "file"
+                    and str(value.get("name") or "").lower().endswith(
+                        (".mkv", ".avi", ".mp4", ".m4v", ".mov", ".wmv", ".mpg", ".mpeg")
+                    )
+                ]
+                videos = all_videos
+                mixed_root = False
+                if not target:
+                    marked = [(value, episode_marker(str(value.get("name") or ""))) for value in all_videos]
+                    videos = [value for value, marker in marked if marker and marker[0] == season]
+                    mixed_root = any(marker and marker[0] != season for _, marker in marked)
+                markers = [episode_marker(str(value.get("name") or "")) for value in videos]
+                if len(markers) < 2 or any(marker is None or marker[0] != season for marker in markers):
+                    return None
+                episodes = sorted({marker[1] for marker in markers if marker})
+                if len(episodes) != len(markers) or episodes != list(range(1, episodes[-1] + 1)):
+                    return None
+                selected_files: list[dict[str, str | int]] = []
+                if mixed_root:
+                    for value in videos:
+                        tth = str(value.get("tth") or "")
+                        size = int(float(value.get("size", 0) or 0))
+                        name = str(value.get("name") or "")
+                        if not tth or not name or size <= 0:
+                            return None
+                        selected_files.append({"name": name, "size": size, "tth": tth})
+                selected = target or folder
+                suffix = self._common_technical_suffix([str(value.get("name") or "") for value in videos])
+                display = f"{folder.get('name') or query} S{season:02d}" + (f" {suffix}" if suffix else "")
+                return {
+                    **selected,
+                    "id": f"filelist:{cid}:{target_path}",
+                    "name": str(selected.get("name") or folder.get("name") or query),
+                    "path": target_path,
+                    "users": folder.get("users"),
+                    "hits": folder.get("hits", 1),
+                    "time": selected.get("time", folder.get("time", 0)),
+                    "_verified_display": display,
+                    "size": sum(int(float(value.get("size", 0) or 0)) for value in videos),
+                    "type": {"id": "bundle", "files": len(videos)},
+                    "_download_via_filelist": not mixed_root,
+                    "_selected_files": selected_files,
+                }
+            except (AirDCError, httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+                logger.info("No se pudo inspeccionar la carpeta %r: %s", folder.get("name"), exc)
+                return None
+            finally:
+                if opened:
+                    try:
+                        await self.http.delete(
+                            f"{self.settings.airdcpp_url}/api/v1/filelists/{cid}", headers=self.headers
+                        )
+                    except httpx.HTTPError:
+                        logger.warning("No se pudo cerrar la lista parcial %s", cid)
+                elif restore_needed and original_path:
+                    try:
+                        await self._change_filelist_directory(cid, original_path)
+                        logger.info("Lista cid=%s restaurada en %r", cid, original_path)
+                    except (AirDCError, httpx.HTTPError):
+                        logger.warning("No se pudo restaurar la lista cid=%s en %r", cid, original_path)
 
     async def _wait_filelist(self, cid: str, expected_path: str | None = None) -> bool:
         deadline = time.monotonic() + self.settings.season_inspect_timeout
@@ -455,12 +496,31 @@ class AirDCClient:
             await asyncio.sleep(0.2)
         return False
 
-    async def _filelist_items(self, cid: str) -> list[dict]:
+    async def _filelist_path(self, cid: str) -> str:
+        response = await self.http.get(f"{self.settings.airdcpp_url}/api/v1/filelists/{cid}", headers=self.headers)
+        response.raise_for_status()
+        return str((response.json().get("location") or {}).get("path") or "")
+
+    async def _change_filelist_directory(self, cid: str, path: str) -> None:
+        response = await self.http.post(
+            f"{self.settings.airdcpp_url}/api/v1/filelists/{cid}/directory",
+            json={"list_path": path},
+            headers=self.headers,
+        )
+        response.raise_for_status()
+        if not await self._wait_filelist(cid, path):
+            raise AirDCError(f"La lista {cid} no cargó la ruta {path!r}")
+
+    async def _filelist_items(self, cid: str, expected_path: str | None = None) -> list[dict]:
         response = await self.http.get(
             f"{self.settings.airdcpp_url}/api/v1/filelists/{cid}/items/0/1000", headers=self.headers
         )
         response.raise_for_status()
-        return list(response.json().get("items", []))
+        data = response.json()
+        actual_path = str(data.get("list_path") or "")
+        if expected_path and actual_path and actual_path != expected_path:
+            raise AirDCError(f"La lista {cid} devolvió {actual_path!r} en lugar de {expected_path!r}")
+        return list(data.get("items", []))
 
     async def download(self, release: SearchResult) -> str:
         if release.selected_files:
@@ -613,28 +673,27 @@ class AirDCClient:
         path = source_path
         if release.item_type == "file":
             path = path.rsplit("/", 1)[0] + "/"
-        try:
-            response = await self.http.get(f"{self.settings.airdcpp_url}/api/v1/filelists", headers=self.headers)
-            response.raise_for_status()
-            is_open = any(str(item.get("id")) == source_cid for item in response.json())
-            if is_open:
-                response = await self.http.post(
-                    f"{self.settings.airdcpp_url}/api/v1/filelists/{source_cid}/directory",
-                    json={"list_path": path},
-                    headers=self.headers,
-                )
-            else:
-                response = await self.http.post(
-                    f"{self.settings.airdcpp_url}/api/v1/filelists",
-                    json={
-                        "user": {"cid": source_cid, "hub_url": source_hub_url},
-                        "directory": path,
-                    },
-                    headers=self.headers,
-                )
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise AirDCError(f"No se pudo abrir la carpeta en AirDC++: {exc}") from exc
+        async with self._filelist_lock(source_cid):
+            try:
+                response = await self.http.get(f"{self.settings.airdcpp_url}/api/v1/filelists", headers=self.headers)
+                response.raise_for_status()
+                is_open = any(str(item.get("id")) == source_cid for item in response.json())
+                if is_open:
+                    await self._change_filelist_directory(source_cid, path)
+                else:
+                    response = await self.http.post(
+                        f"{self.settings.airdcpp_url}/api/v1/filelists",
+                        json={
+                            "user": {"cid": source_cid, "hub_url": source_hub_url},
+                            "directory": path,
+                        },
+                        headers=self.headers,
+                    )
+                    response.raise_for_status()
+                    if not await self._wait_filelist(source_cid, path):
+                        raise AirDCError(f"La lista {source_cid} no cargó la ruta {path!r}")
+            except httpx.HTTPError as exc:
+                raise AirDCError(f"No se pudo abrir la carpeta en AirDC++: {exc}") from exc
 
         cid = urllib.parse.quote(source_cid, safe="")
         return f"{self.settings.airdcpp_web_url}/filelists/session/{cid}"
